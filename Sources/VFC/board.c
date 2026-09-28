@@ -39,6 +39,8 @@ enum {
     MBX_SERIAL_RX_COUNT = 0x140,
     MBX_SERIAL_RX_DATA = 0x144,
     MBX_SERIAL_TX_DATA = 0x148,
+    MBX_BLACKBOX_DATA = 0x150,
+    MBX_BLACKBOX_CONTROL = 0x154,
 };
 
 #define BOARD_INFO_MAGIC 0x56464331u    // "VFC1"
@@ -166,6 +168,26 @@ static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
     case MBX_MOTOR_COUNT: vfc->motorCount = value; return;
     case MBX_MOTOR_SEQ: vfc->motorSeq = value; return;
     case MBX_SERIAL_TX_DATA: fifo_push(&vfc->fromGuest, (uint8_t)value); return;
+    case MBX_BLACKBOX_DATA:
+        if (vfc->blackboxLength == vfc->blackboxCapacity) {
+            const size_t capacity = vfc->blackboxCapacity ? vfc->blackboxCapacity * 2 : 1 << 20;
+            uint8_t *grown = realloc(vfc->blackbox, capacity);
+            if (!grown) {
+                return;
+            }
+            vfc->blackbox = grown;
+            vfc->blackboxCapacity = capacity;
+        }
+        vfc->blackbox[vfc->blackboxLength++] = (uint8_t)value;
+        return;
+    case MBX_BLACKBOX_CONTROL:
+        if (value == 1) {
+            vfc->blackboxOpen = true;
+            vfc->blackboxLogs++;
+        } else if (value == 2) {
+            vfc->blackboxOpen = false;
+        }
+        return;
     default:
         break;
     }
@@ -250,6 +272,7 @@ void vfc_destroy(vfc_t *vfc)
     if (!vfc) {
         return;
     }
+    free(vfc->blackbox);
     free(vfc->flash);
     free(vfc->ram);
     free(vfc->scs);
@@ -429,10 +452,10 @@ void vfc_set_battery(vfc_t *vfc, uint32_t millivolts, uint32_t milliamps)
     vfc->currentMa = milliamps;
 }
 
-void vfc_set_erpm(vfc_t *vfc, int motor, uint32_t erpm)
+void vfc_set_erpm100(vfc_t *vfc, int motor, uint32_t erpm100)
 {
     if (motor >= 0 && motor < 8) {
-        vfc->erpm[motor] = erpm;
+        vfc->erpm[motor] = erpm100;
     }
 }
 
@@ -503,6 +526,30 @@ void vfc_config_write(vfc_t *vfc, const uint8_t *data, size_t length)
     if (n) {
         memcpy(vfc->ram + (vfc->eepromAddress - VFC_RAM_BASE), data, n);
     }
+}
+
+size_t vfc_blackbox_read(vfc_t *vfc, uint8_t *out, size_t capacity)
+{
+    const size_t n = capacity < vfc->blackboxLength ? capacity : vfc->blackboxLength;
+    memcpy(out, vfc->blackbox, n);
+    memmove(vfc->blackbox, vfc->blackbox + n, vfc->blackboxLength - n);
+    vfc->blackboxLength -= n;
+    return n;
+}
+
+size_t vfc_blackbox_pending(const vfc_t *vfc)
+{
+    return vfc->blackboxLength;
+}
+
+uint32_t vfc_blackbox_logs(const vfc_t *vfc)
+{
+    return vfc->blackboxLogs;
+}
+
+bool vfc_blackbox_logging(const vfc_t *vfc)
+{
+    return vfc->blackboxOpen;
 }
 
 uint64_t vfc_instructions(const vfc_t *vfc)

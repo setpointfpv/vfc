@@ -76,6 +76,11 @@ struct vfc {
     uint32_t motorSeq;
     uint32_t motor[8];
     vfc_fifo_t toGuest, fromGuest;
+    // Blackbox log bytes, until the host takes them.
+    uint8_t *blackbox;
+    size_t blackboxLength, blackboxCapacity;
+    uint32_t blackboxLogs;
+    bool blackboxOpen;
     char console[VFC_CONSOLE_CAPACITY];
     uint32_t consoleLength;
 

@@ -35,6 +35,7 @@
 #ifndef VFC_H
 #define VFC_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -91,7 +92,9 @@ void vfc_post_sensor(vfc_t *vfc, const int16_t gyro[3], const int16_t acc[3]);
 /// A whole RC frame, channel values in microseconds.
 void vfc_post_rc(vfc_t *vfc, const uint16_t *channels, int count);
 void vfc_set_battery(vfc_t *vfc, uint32_t millivolts, uint32_t milliamps);
-void vfc_set_erpm(vfc_t *vfc, int motor, uint32_t erpm);
+/// A motor's speed as bidirectional DShot reports it, in eRPM / 100 (the
+/// unit a blackbox log records).
+void vfc_set_erpm100(vfc_t *vfc, int motor, uint32_t erpm100);
 
 // Outputs.
 int vfc_motor_count(const vfc_t *vfc);
@@ -103,6 +106,14 @@ uint32_t vfc_stage(const vfc_t *vfc);
 // The serial byte stream (MSP and the CLI).
 void vfc_serial_write(vfc_t *vfc, const uint8_t *data, size_t length);
 size_t vfc_serial_read(vfc_t *vfc, uint8_t *out, size_t capacity);
+
+// The blackbox log: an ordinary .bbl byte stream, one log per arm.
+size_t vfc_blackbox_read(vfc_t *vfc, uint8_t *out, size_t capacity);
+size_t vfc_blackbox_pending(const vfc_t *vfc);
+/// How many logs the firmware has begun.
+uint32_t vfc_blackbox_logs(const vfc_t *vfc);
+/// Whether a log is open now.
+bool vfc_blackbox_logging(const vfc_t *vfc);
 
 // Config storage, the board's flash.
 size_t vfc_config_size(const vfc_t *vfc);
