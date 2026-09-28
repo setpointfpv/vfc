@@ -2,3 +2,4 @@
 .swiftpm/
 *.o
 /tools/run
+tools/difftest

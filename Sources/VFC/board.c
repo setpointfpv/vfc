@@ -80,7 +80,13 @@ static uint32_t cycles_at(const vfc_t *vfc, uint64_t ns)
 
 // --- Mailbox
 
-static uint32_t mailbox_read(vfc_t *vfc, uint32_t offset)
+#ifdef VFC_TRACE
+// Development builds only: every mailbox access, for replaying a run in a
+// reference emulator.
+void vfc_trace_mailbox(vfc_t *vfc, bool write, uint32_t offset, uint32_t value);
+#endif
+
+static uint32_t mailbox_register(vfc_t *vfc, uint32_t offset)
 {
     const uint64_t us = vfc->timeNs / 1000;
     switch (offset) {
@@ -126,8 +132,20 @@ static uint32_t mailbox_read(vfc_t *vfc, uint32_t offset)
     return 0;
 }
 
+static uint32_t mailbox_read(vfc_t *vfc, uint32_t offset)
+{
+    const uint32_t value = mailbox_register(vfc, offset);
+#ifdef VFC_TRACE
+    vfc_trace_mailbox(vfc, false, offset, value);
+#endif
+    return value;
+}
+
 static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
 {
+#ifdef VFC_TRACE
+    vfc_trace_mailbox(vfc, true, offset, value);
+#endif
     switch (offset) {
     case MBX_GUEST_ABI: vfc->guestAbi = value; return;
     case MBX_STAGE: vfc->stage = value; return;
