@@ -12,7 +12,7 @@
 //
 //   cc -O2 -DVFC_TRACE -ffp-contract=off -ISources/VFC/include -ISources/VFC \
 //      -I<unicorn>/include Sources/VFC/*.c tools/difftest.c <libunicorn.2.dylib> -o tools/difftest
-//   tools/difftest firmware.bin [instructions]
+//   tools/difftest firmware.bin [instructions] [--snapshot <file>]
 
 #include <math.h>
 #include <stdio.h>
@@ -192,7 +192,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s firmware.bin [instructions]\n", argv[0]);
         return 2;
     }
-    const uint64_t limit = argc > 2 ? strtoull(argv[2], NULL, 10) : 5000000;
+    uint64_t limit = 5000000;
+    const char *snapshotPath = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) {
+            snapshotPath = argv[++i];
+        } else {
+            limit = strtoull(argv[i], NULL, 10);
+        }
+    }
 
     FILE *f = fopen(argv[1], "rb");
     if (!f) {
@@ -229,6 +237,64 @@ int main(int argc, char **argv)
     uint32_t lr = 0xFFFFFFFFu, xpsr = 0x01000000u;
     check(uc_reg_write(uc, UC_ARM_REG_LR, &lr), "lr");
     check(uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr), "xpsr");
+
+    // Or start from a snapshot, such as an armed quad in flight
+    // (setpoint-cli vfc <log> --firmware <bin> --snapshot <file>).
+    bool armed = false;
+    if (snapshotPath) {
+        FILE *s = fopen(snapshotPath, "rb");
+        if (!s) {
+            perror(snapshotPath);
+            return 1;
+        }
+        fseek(s, 0, SEEK_END);
+        const long snapshotLength = ftell(s);
+        fseek(s, 0, SEEK_SET);
+        uint8_t *snapshot = malloc((size_t)snapshotLength);
+        if (fread(snapshot, 1, (size_t)snapshotLength, s) != (size_t)snapshotLength
+            || vfc_restore(vfc, snapshot, (size_t)snapshotLength) != VFC_OK) {
+            fprintf(stderr, "snapshot does not fit this image and build\n");
+            return 1;
+        }
+        fclose(s);
+        free(snapshot);
+        armed = true;
+
+        // Let Unicorn open its FP context itself with one throwaway
+        // instruction (vmov.f32 s0, s0), as the firmware did long ago. Setting
+        // CONTROL.FPCA by register write alone leaves QEMU's cached state
+        // saying a fresh context is due, which would reset FPSCR at the
+        // firmware's next floating point instruction.
+        const uint8_t preamble[] = { 0xB0, 0xEE, 0x40, 0x0A };
+        check(uc_mem_map(uc, 0x10000000, 0x1000, UC_PROT_READ | UC_PROT_EXEC), "map preamble");
+        check(uc_mem_write(uc, 0x10000000, preamble, sizeof(preamble)), "write preamble");
+        check(uc_emu_start(uc, 0x10000001, 0xFFFFFFFFu, 0, 1), "run preamble");
+
+        const vfc_cpu_t *cpu = &vfc->cpu;
+        check(uc_mem_write(uc, VFC_RAM_BASE, vfc->ram, VFC_RAM_SIZE), "ram");
+        check(uc_mem_write(uc, VFC_SCS_BASE, vfc->scs, VFC_SCS_SIZE), "scs");
+        for (int i = 0; i < 13; i++) {
+            check(uc_reg_write(uc, UC_ARM_REG_R0 + i, &cpu->r[i]), "r");
+        }
+        check(uc_reg_write(uc, UC_ARM_REG_SP, &cpu->r[13]), "sp");
+        check(uc_reg_write(uc, UC_ARM_REG_LR, &cpu->r[14]), "lr");
+        for (int i = 0; i < 32; i++) {
+            check(uc_reg_write(uc, UC_ARM_REG_S0 + i, &cpu->s.u[i]), "s");
+        }
+        check(uc_reg_write(uc, UC_ARM_REG_FPSCR, &cpu->fpscr), "fpscr");
+        check(uc_reg_write(uc, UC_ARM_REG_BASEPRI, &cpu->basepri), "basepri");
+        check(uc_reg_write(uc, UC_ARM_REG_PRIMASK, &cpu->primask), "primask");
+        xpsr = ((uint32_t)cpu->n << 31) | ((uint32_t)cpu->z << 30) | ((uint32_t)cpu->c << 29)
+             | ((uint32_t)cpu->v << 28) | ((uint32_t)cpu->q << 27) | ((uint32_t)cpu->ge << 16)
+             | 0x01000000u | ((uint32_t)(cpu->itstate & 3) << 25) | ((uint32_t)(cpu->itstate >> 2) << 10);
+        check(uc_reg_write(uc, UC_ARM_REG_XPSR, &xpsr), "xpsr");
+        pc = cpu->r[15] | 1;
+        uint32_t readControl = 0, readFpscr = 0;
+        uc_reg_read(uc, UC_ARM_REG_CONTROL, &readControl);
+        uc_reg_read(uc, UC_ARM_REG_FPSCR, &readFpscr);
+        printf("from snapshot: pc %08x, %.3f s virtual (unicorn CONTROL %x FPSCR %08x, vfc FPSCR %08x)\n",
+               cpu->r[15], vfc_time_ns(vfc) * 1e-9, readControl, readFpscr, cpu->fpscr);
+    }
 
     const int16_t acc[3] = { 0, 0, 2048 };
     state_t a, b;
@@ -311,14 +377,33 @@ int main(int argc, char **argv)
                 uint16_t rc[8] = { 1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000 };
                 rc[0] = (uint16_t)(1500 + 400 * sin(2 * M_PI * 0.7 * t));
                 rc[1] = (uint16_t)(1500 + 300 * sin(2 * M_PI * 1.1 * t));
+                if (armed) {
+                    // Keep the arm switch on and fly: throttle moving through
+                    // the middle, and motor speed for the RPM filter.
+                    rc[2] = (uint16_t)(1450 + 250 * sin(2 * M_PI * 0.4 * t));
+                    rc[4] = 2000;
+                    for (int m = 0; m < 4; m++) {
+                        vfc_set_erpm100(vfc, m, (uint32_t)(250 + 100 * sin(2 * M_PI * (0.4 * t + 0.1 * m))));
+                    }
+                }
                 vfc_post_rc(vfc, rc, 8);
             }
             vfc_set_time_ns(vfc, vfc_wake_time_ns(vfc));
             wakes++;
+            static bool wasLogging = true;
+            if (armed && wasLogging && !vfc_blackbox_logging(vfc)) {
+                printf("disarmed at %.3f s virtual, step %llu\n", t, (unsigned long long)steps);
+                wasLogging = false;
+            }
         }
     }
     printf("%llu instructions matched (%llu wakes, %.3f s virtual)\n",
            (unsigned long long)steps, (unsigned long long)wakes, vfc_time_ns(vfc) * 1e-9);
+    if (armed) {
+        printf("still armed and logging: %s; motors %.0f %.0f %.0f %.0f\n",
+               vfc_blackbox_logging(vfc) ? "yes" : "NO",
+               vfc_motor(vfc, 0), vfc_motor(vfc, 1), vfc_motor(vfc, 2), vfc_motor(vfc, 3));
+    }
     uc_close(uc);
     return 0;
 }

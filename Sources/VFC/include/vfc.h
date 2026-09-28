@@ -122,6 +122,17 @@ size_t vfc_config_size(const vfc_t *vfc);
 size_t vfc_config_read(const vfc_t *vfc, uint8_t *out, size_t capacity);
 void vfc_config_write(vfc_t *vfc, const uint8_t *data, size_t length);
 
+// Snapshots: the whole board (core, RAM, mailbox, time) at a moment, to
+// resume from later or copy into another instance running the same image.
+// Pending serial, blackbox and console output are not included. A snapshot is
+// only valid for the same firmware image and the same build of this library.
+size_t vfc_snapshot_size(const vfc_t *vfc);
+/// Writes a snapshot into `out`, which must hold vfc_snapshot_size() bytes.
+void vfc_snapshot(const vfc_t *vfc, uint8_t *out);
+/// Restores a snapshot. Fails with VFC_ERR_IMAGE if it was taken from another
+/// image or another build.
+vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length);
+
 // Diagnostics.
 uint64_t vfc_instructions(const vfc_t *vfc);
 /// Why the core stopped with VFC_STOP_FAULT, or NULL.

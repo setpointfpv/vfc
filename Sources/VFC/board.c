@@ -554,6 +554,83 @@ bool vfc_blackbox_logging(const vfc_t *vfc)
     return vfc->blackboxOpen;
 }
 
+// --- Snapshots
+
+typedef struct {
+    uint32_t magic;             // "VFCS"
+    uint32_t structSize;        // sizeof(vfc_t): the same build of the library
+    uint32_t flashUsed;
+    uint32_t flashHash;         // FNV-1a of the image
+} snapshot_header_t;
+
+#define SNAPSHOT_MAGIC 0x53434656u
+
+static uint32_t image_hash(const vfc_t *vfc)
+{
+    uint32_t hash = 2166136261u;
+    for (uint32_t i = 0; i < vfc->flashUsed; i++) {
+        hash = (hash ^ vfc->flash[i]) * 16777619u;
+    }
+    return hash;
+}
+
+size_t vfc_snapshot_size(const vfc_t *vfc)
+{
+    (void)vfc;
+    return sizeof(snapshot_header_t) + sizeof(vfc_t) + VFC_RAM_SIZE + VFC_SCS_SIZE;
+}
+
+void vfc_snapshot(const vfc_t *vfc, uint8_t *out)
+{
+    const snapshot_header_t header = {
+        .magic = SNAPSHOT_MAGIC,
+        .structSize = (uint32_t)sizeof(vfc_t),
+        .flashUsed = vfc->flashUsed,
+        .flashHash = image_hash(vfc),
+    };
+    memcpy(out, &header, sizeof(header));
+    out += sizeof(header);
+    vfc_t copy = *vfc;
+    copy.flash = copy.ram = copy.scs = copy.blackbox = NULL;
+    copy.blackboxLength = copy.blackboxCapacity = 0;
+    copy.consoleLength = 0;
+    copy.fromGuest.head = copy.fromGuest.tail = 0;
+    memcpy(out, &copy, sizeof(copy));
+    out += sizeof(copy);
+    memcpy(out, vfc->ram, VFC_RAM_SIZE);
+    out += VFC_RAM_SIZE;
+    memcpy(out, vfc->scs, VFC_SCS_SIZE);
+}
+
+vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length)
+{
+    snapshot_header_t header;
+    if (length != vfc_snapshot_size(vfc)) {
+        return VFC_ERR_IMAGE;
+    }
+    memcpy(&header, snapshot, sizeof(header));
+    if (header.magic != SNAPSHOT_MAGIC || header.structSize != sizeof(vfc_t)
+        || header.flashUsed != vfc->flashUsed || header.flashHash != image_hash(vfc)) {
+        return VFC_ERR_IMAGE;
+    }
+    snapshot += sizeof(header);
+
+    uint8_t *flash = vfc->flash, *ram = vfc->ram, *scs = vfc->scs, *blackbox = vfc->blackbox;
+    const size_t blackboxCapacity = vfc->blackboxCapacity;
+    memcpy(vfc, snapshot, sizeof(vfc_t));
+    vfc->flash = flash;
+    vfc->ram = ram;
+    vfc->scs = scs;
+    vfc->blackbox = blackbox;
+    vfc->blackboxCapacity = blackboxCapacity;
+    vfc->blackboxLength = 0;
+    snapshot += sizeof(vfc_t);
+    memcpy(vfc->ram, snapshot, VFC_RAM_SIZE);
+    snapshot += VFC_RAM_SIZE;
+    memcpy(vfc->scs, snapshot, VFC_SCS_SIZE);
+    return VFC_OK;
+}
+
 uint64_t vfc_instructions(const vfc_t *vfc)
 {
     return vfc->instructions;

@@ -182,4 +182,26 @@ public final class VirtualFlightController {
         let n = vfc_console_read(handle, &buffer, buffer.count)
         return String(decoding: buffer.prefix(n).map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
+
+    // MARK: Snapshots
+
+    /// The whole board at this moment: core, RAM, mailbox and time. Pending
+    /// serial and blackbox output are not included. Only valid for the same
+    /// image and the same build of this library.
+    public func snapshot() -> Data {
+        var out = Data(count: vfc_snapshot_size(handle))
+        out.withUnsafeMutableBytes { raw in
+            vfc_snapshot(handle, raw.bindMemory(to: UInt8.self).baseAddress)
+        }
+        return out
+    }
+
+    /// Puts the board back as a snapshot of it (or of another board running
+    /// the same image) left it.
+    public func restore(_ snapshot: Data) throws {
+        let status = snapshot.withUnsafeBytes { raw in
+            vfc_restore(handle, raw.bindMemory(to: UInt8.self).baseAddress, raw.count)
+        }
+        guard status == VFC_OK else { throw LoadError.notAnImage }
+    }
 }
