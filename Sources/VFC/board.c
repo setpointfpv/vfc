@@ -80,6 +80,20 @@ static uint32_t cycles_at(const vfc_t *vfc, uint64_t ns)
     return (uint32_t)(((unsigned __int128)ns * vfc->clockHz) / 1000000000u);
 }
 
+enum { TIME_US_LO, TIME_US_HI, TIME_CYCLES, TIME_IDLE_UNTIL };
+_Static_assert(MBX_TIME_US_LO == VFC_MBX_TIME_REGS && MBX_TIME_US_HI == MBX_TIME_US_LO + 4
+               && MBX_CYCLES == MBX_TIME_US_LO + 8 && MBX_IDLE_UNTIL == MBX_TIME_US_LO + 12,
+               "timeRegs mirrors four consecutive mailbox registers");
+
+static void set_time(vfc_t *vfc, uint64_t ns)
+{
+    const uint64_t us = ns / 1000;
+    vfc->timeNs = ns;
+    vfc->timeRegs[TIME_US_LO] = (uint32_t)us;
+    vfc->timeRegs[TIME_US_HI] = (uint32_t)(us >> 32);
+    vfc->timeRegs[TIME_CYCLES] = cycles_at(vfc, ns);
+}
+
 // --- Mailbox
 
 #ifdef VFC_TRACE
@@ -90,16 +104,15 @@ void vfc_trace_mailbox(vfc_t *vfc, bool write, uint32_t offset, uint32_t value);
 
 static uint32_t mailbox_register(vfc_t *vfc, uint32_t offset)
 {
-    const uint64_t us = vfc->timeNs / 1000;
     switch (offset) {
     case MBX_MAGIC: return BOARD_INFO_MAGIC;
     case MBX_HOST_ABI: return VFC_ABI;
     case MBX_GUEST_ABI: return vfc->guestAbi;
     case MBX_STAGE: return vfc->stage;
-    case MBX_TIME_US_LO: return (uint32_t)us;
-    case MBX_TIME_US_HI: return (uint32_t)(us >> 32);
-    case MBX_CYCLES: return cycles_at(vfc, vfc->timeNs);
-    case MBX_IDLE_UNTIL: return vfc->idleUntilCycles;
+    case MBX_TIME_US_LO: return vfc->timeRegs[TIME_US_LO];
+    case MBX_TIME_US_HI: return vfc->timeRegs[TIME_US_HI];
+    case MBX_CYCLES: return vfc->timeRegs[TIME_CYCLES];
+    case MBX_IDLE_UNTIL: return vfc->timeRegs[TIME_IDLE_UNTIL];
     case MBX_CLOCK_HZ: return vfc->clockHz;
     case MBX_SENSOR_SEQ: return vfc->sensorSeq;
     case MBX_RC_COUNT: return vfc->rcCount;
@@ -151,7 +164,7 @@ static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
     switch (offset) {
     case MBX_GUEST_ABI: vfc->guestAbi = value; return;
     case MBX_STAGE: vfc->stage = value; return;
-    case MBX_IDLE_UNTIL: vfc->idleUntilCycles = value; return;
+    case MBX_IDLE_UNTIL: vfc->timeRegs[TIME_IDLE_UNTIL] = value; return;
     case MBX_PUTC:
         if (vfc->consoleLength < VFC_CONSOLE_CAPACITY) {
             vfc->console[vfc->consoleLength++] = (char)value;
@@ -254,8 +267,10 @@ vfc_t *vfc_create(void)
     if (!vfc) {
         return NULL;
     }
-    vfc->flash = calloc(1, VFC_FLASH_SIZE);
-    vfc->ram = calloc(1, VFC_RAM_SIZE);
+    // A few spare bytes past each: the JIT's range check lets an access start
+    // at any offset inside the region.
+    vfc->flash = calloc(1, VFC_FLASH_SIZE + 16);
+    vfc->ram = calloc(1, VFC_RAM_SIZE + 16);
     vfc->scs = calloc(1, VFC_SCS_SIZE);
     if (!vfc->flash || !vfc->ram || !vfc->scs) {
         vfc_destroy(vfc);
@@ -263,7 +278,10 @@ vfc_t *vfc_create(void)
     }
     memset(vfc->flash, 0xFF, VFC_FLASH_SIZE);
     vfc->clockHz = DEFAULT_CLOCK_HZ;
+    set_time(vfc, 0);
     vfc->vbatMv = 16800;
+    const char *jit = getenv("VFC_JIT");
+    vfc->jitEnabled = vfc_jit_available() && !(jit && jit[0] == '0');
     return vfc;
 }
 
@@ -272,6 +290,7 @@ void vfc_destroy(vfc_t *vfc)
     if (!vfc) {
         return;
     }
+    vfc_jit_free(vfc);
     free(vfc->blackbox);
     free(vfc->flash);
     free(vfc->ram);
@@ -306,7 +325,8 @@ void vfc_reset(vfc_t *vfc)
 
     vfc->stopRequested = false;
     vfc->fault[0] = 0;
-    vfc->idleUntilCycles = cycles_at(vfc, vfc->timeNs);
+    set_time(vfc, vfc->timeNs);
+    vfc->timeRegs[TIME_IDLE_UNTIL] = vfc->timeRegs[TIME_CYCLES];
     vfc->guestAbi = 0;
     vfc->stage = 0;
     vfc->motorCount = 0;
@@ -339,6 +359,7 @@ vfc_error_t vfc_load(vfc_t *vfc, const uint8_t *image, size_t length, uint32_t b
         return VFC_ERR_ABI;
     }
 
+    vfc_jit_flush(vfc);
     memset(vfc->flash, 0xFF, VFC_FLASH_SIZE);
     memcpy(vfc->flash, image, length);
     vfc->flashUsed = (uint32_t)length;
@@ -369,13 +390,17 @@ vfc_stop_t vfc_run(vfc_t *vfc, uint64_t budget)
         return vfc->stopReason;             // faulted or awaiting reset
     }
     vfc->stopRequested = false;
-    vfc_cpu_run(vfc, budget);
+    if (vfc->jitEnabled) {
+        vfc_jit_run(vfc, budget);
+    } else {
+        vfc_cpu_run(vfc, budget);
+    }
     return vfc->stopRequested ? vfc->stopReason : VFC_STOP_BUDGET;
 }
 
 void vfc_set_time_ns(vfc_t *vfc, uint64_t ns)
 {
-    vfc->timeNs = ns;
+    set_time(vfc, ns);
 }
 
 uint64_t vfc_time_ns(const vfc_t *vfc)
@@ -385,13 +410,13 @@ uint64_t vfc_time_ns(const vfc_t *vfc)
 
 uint64_t vfc_wake_time_ns(const vfc_t *vfc)
 {
-    const int32_t ahead = (int32_t)(vfc->idleUntilCycles - cycles_at(vfc, vfc->timeNs));
+    const int32_t ahead = (int32_t)(vfc->timeRegs[TIME_IDLE_UNTIL] - vfc->timeRegs[TIME_CYCLES]);
     if (ahead <= 0) {
         return vfc->timeNs;
     }
     // The first nanosecond at which the cycle counter reaches the target.
     uint64_t wake = vfc->timeNs + ((uint64_t)ahead * 1000000000u + vfc->clockHz - 1) / vfc->clockHz;
-    while (wake > vfc->timeNs && (int32_t)(vfc->idleUntilCycles - cycles_at(vfc, wake - 1)) <= 0) {
+    while (wake > vfc->timeNs && (int32_t)(vfc->timeRegs[TIME_IDLE_UNTIL] - cycles_at(vfc, wake - 1)) <= 0) {
         wake--;
     }
     return wake;
@@ -406,12 +431,12 @@ vfc_stop_t vfc_advance_to(vfc_t *vfc, uint64_t ns, uint64_t budget)
             const uint64_t wake = vfc_wake_time_ns(vfc);
             if (wake >= ns) {
                 if (ns > vfc->timeNs) {
-                    vfc->timeNs = ns;
+                    set_time(vfc, ns);
                 }
                 return VFC_STOP_IDLE;
             }
             if (wake > vfc->timeNs) {
-                vfc->timeNs = wake;
+                set_time(vfc, wake);
             }
         }
         const vfc_stop_t stop = vfc_run(vfc, budget);
@@ -419,6 +444,16 @@ vfc_stop_t vfc_advance_to(vfc_t *vfc, uint64_t ns, uint64_t budget)
             return stop;
         }
     }
+}
+
+void vfc_set_jit(vfc_t *vfc, bool enabled)
+{
+    vfc->jitEnabled = enabled && vfc_jit_available();
+}
+
+bool vfc_jit_enabled(const vfc_t *vfc)
+{
+    return vfc->jitEnabled;
 }
 
 uint32_t vfc_clock_hz(const vfc_t *vfc)
@@ -580,6 +615,11 @@ size_t vfc_snapshot_size(const vfc_t *vfc)
     return sizeof(snapshot_header_t) + sizeof(vfc_t) + VFC_RAM_SIZE + VFC_SCS_SIZE;
 }
 
+// The JIT's fields: its code cache and settings belong to an instance, not to
+// the machine state a snapshot carries.
+#define JIT_STATE_START offsetof(vfc_t, jitBudget)
+#define JIT_STATE_LENGTH (offsetof(vfc_t, flash) - offsetof(vfc_t, jitBudget))
+
 void vfc_snapshot(const vfc_t *vfc, uint8_t *out)
 {
     const snapshot_header_t header = {
@@ -591,6 +631,7 @@ void vfc_snapshot(const vfc_t *vfc, uint8_t *out)
     memcpy(out, &header, sizeof(header));
     out += sizeof(header);
     vfc_t copy = *vfc;
+    memset((uint8_t *)&copy + JIT_STATE_START, 0, JIT_STATE_LENGTH);
     copy.flash = copy.ram = copy.scs = copy.blackbox = NULL;
     copy.blackboxLength = copy.blackboxCapacity = 0;
     copy.consoleLength = 0;
@@ -617,7 +658,10 @@ vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length)
 
     uint8_t *flash = vfc->flash, *ram = vfc->ram, *scs = vfc->scs, *blackbox = vfc->blackbox;
     const size_t blackboxCapacity = vfc->blackboxCapacity;
+    uint8_t jit[JIT_STATE_LENGTH];                  // this instance's own, not the snapshot's
+    memcpy(jit, (uint8_t *)vfc + JIT_STATE_START, JIT_STATE_LENGTH);
     memcpy(vfc, snapshot, sizeof(vfc_t));
+    memcpy((uint8_t *)vfc + JIT_STATE_START, jit, JIT_STATE_LENGTH);
     vfc->flash = flash;
     vfc->ram = ram;
     vfc->scs = scs;

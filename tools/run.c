@@ -154,5 +154,6 @@ int main(int argc, char **argv)
         printf("\n");
         return report(vfc, stop);
     }
+    vfc_destroy(vfc);
     return 0;
 }

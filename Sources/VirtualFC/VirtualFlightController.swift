@@ -90,6 +90,14 @@ public final class VirtualFlightController {
     public var stage: UInt32 { vfc_stage(handle) }
     public var instructions: UInt64 { vfc_instructions(handle) }
 
+    /// Native code for the firmware (Apple silicon), rather than the
+    /// interpreter: the same results, about ten times faster. On by default
+    /// where available; `VFC_JIT=0` in the environment turns it off.
+    public var usesJIT: Bool {
+        get { vfc_jit_enabled(handle) }
+        set { vfc_set_jit(handle, newValue) }
+    }
+
     // MARK: Inputs
 
     /// One gyro and accelerometer sample in sensor counts: 16.4 per deg/s for

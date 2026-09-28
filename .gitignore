@@ -3,3 +3,6 @@
 *.o
 /tools/run
 tools/difftest
+tools/jitdiff
+tools/encodings
+*.dSYM/

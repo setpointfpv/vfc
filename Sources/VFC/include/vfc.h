@@ -133,6 +133,12 @@ void vfc_snapshot(const vfc_t *vfc, uint8_t *out);
 /// image or another build.
 vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length);
 
+/// Native code for the firmware (Apple silicon), or the interpreter. On by
+/// default where available; VFC_JIT=0 in the environment turns it off. The
+/// results are the same either way, instruction for instruction.
+void vfc_set_jit(vfc_t *vfc, bool enabled);
+bool vfc_jit_enabled(const vfc_t *vfc);
+
 // Diagnostics.
 uint64_t vfc_instructions(const vfc_t *vfc);
 /// Why the core stopped with VFC_STOP_FAULT, or NULL.

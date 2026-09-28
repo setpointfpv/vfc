@@ -217,6 +217,7 @@ int main(int argc, char **argv)
     fclose(f);
 
     vfc_t *vfc = vfc_create();
+    vfc_set_jit(vfc, false);            // the interpreter is what's checked here; jitdiff checks the JIT against it
     if (vfc_load(vfc, image, (size_t)length, VFC_FLASH_BASE) != VFC_OK) {
         fprintf(stderr, "vfc load failed\n");
         return 1;
