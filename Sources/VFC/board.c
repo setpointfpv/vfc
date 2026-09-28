@@ -401,8 +401,10 @@ vfc_stop_t vfc_advance_to(vfc_t *vfc, uint64_t ns, uint64_t budget)
 {
     for (;;) {
         if (sleeping(vfc)) {
+            // Work due exactly at `ns` waits for the next call, so the host
+            // can post the inputs for that moment first.
             const uint64_t wake = vfc_wake_time_ns(vfc);
-            if (wake > ns) {
+            if (wake >= ns) {
                 if (ns > vfc->timeNs) {
                     vfc->timeNs = ns;
                 }

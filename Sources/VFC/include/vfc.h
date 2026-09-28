@@ -80,8 +80,10 @@ void vfc_set_time_ns(vfc_t *vfc, uint64_t ns);
 uint64_t vfc_time_ns(const vfc_t *vfc);
 /// When the sleeping firmware next has work: never earlier than now.
 uint64_t vfc_wake_time_ns(const vfc_t *vfc);
-/// Moves time to the wake time and runs, repeatedly, until time would pass
-/// `ns`; then sets time to `ns`. Returns the last stop reason.
+/// Moves time to the wake time and runs, repeatedly, for all work due before
+/// `ns`; then sets time to `ns`. Work due at exactly `ns` runs in the next
+/// call, after the host has posted that moment's inputs. Returns the last
+/// stop reason.
 vfc_stop_t vfc_advance_to(vfc_t *vfc, uint64_t ns, uint64_t budget);
 uint32_t vfc_clock_hz(const vfc_t *vfc);
 
