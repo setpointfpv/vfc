@@ -12,17 +12,32 @@
 #include "vfc.h"
 
 #define VFC_FLASH_BASE      0x08000000u
-#define VFC_FLASH_SIZE      (2u * 1024 * 1024)
 #define VFC_RAM_BASE        0x20000000u
-#define VFC_RAM_SIZE        (512u * 1024)
 #define VFC_MAILBOX_BASE    0x40000000u
 #define VFC_MAILBOX_SIZE    0x1000u
 #define VFC_MBX_TIME_REGS   0x010u      // TIME_US_LO: the first of vfc_t.timeRegs
 #define VFC_SCS_BASE        0xE0000000u
-#define VFC_SCS_SIZE        0x00100000u
 
+#ifndef VFC_CBMC
+#define VFC_FLASH_BITS      21          // 2 MB
+#define VFC_RAM_BITS        19          // 512 KB
+#define VFC_SCS_SIZE        0x00100000u
 #define VFC_SERIAL_CAPACITY 65536u
 #define VFC_CONSOLE_CAPACITY 4096u
+#define VFC_BLACKBOX_CHUNK  (1u << 20)  // the blackbox buffer's first size
+#else
+// The bounded model checker (tests/cbmc) proves the same code with buffers
+// small enough for it to hold. Nothing depends on the sizes but through these
+// names; never for a real build.
+#define VFC_FLASH_BITS      9
+#define VFC_RAM_BITS        8
+#define VFC_SCS_SIZE        0x100u
+#define VFC_SERIAL_CAPACITY 16u
+#define VFC_CONSOLE_CAPACITY 16u
+#define VFC_BLACKBOX_CHUNK  16u
+#endif
+#define VFC_FLASH_SIZE      (1u << VFC_FLASH_BITS)
+#define VFC_RAM_SIZE        (1u << VFC_RAM_BITS)
 
 typedef struct {
     uint8_t data[VFC_SERIAL_CAPACITY];

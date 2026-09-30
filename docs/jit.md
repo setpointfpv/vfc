@@ -72,9 +72,16 @@ branch, or 48 instructions. `jit_emit.h` is the AArch64 encoder it uses.
   instructions in all.
 - Setpoint's replay, filter measurement and virtual-quad outputs are byte
   for byte the same with `VFC_JIT=0` and without.
+- `tools/jitfuzz.c` runs every 16-bit encoding, random 32-bit ones and IT
+  blocks on both, from edge-biased random states, without firmware.
+- `tests/z3` proves the translation of each 16-bit instruction that doesn't
+  touch memory equal to the instruction, from every state.
 
-The interpreter itself is checked against Unicorn (`tools/difftest.c`), so the
-chain runs JIT → interpreter → Unicorn.
+Built with `-DVFC_JIT_EMULATED` and `tools/jitemu.c`, the JIT runs on any
+host, its code in Unicorn's AArch64 emulator; `make fuzz` does that off
+Apple silicon. The interpreter itself is checked against Unicorn
+(`tools/difftest.c`), so the chain runs JIT → interpreter → Unicorn. See
+`docs/verification.md` for all of it.
 
 ```sh
 cc -O2 -ffp-contract=off -ISources/VFC/include -ISources/VFC Sources/VFC/*.c tools/jitdiff.c -o tools/jitdiff

@@ -244,9 +244,9 @@ static void goto_w0(tr_t *t)
     // The table lookup, here rather than in one shared stub, so that each
     // indirect branch has its own `br` for the predictor to learn.
     a64_buf_t *h = &t->hot;
-    a64_movz(h, X16, 0x0800, 1);
+    a64_movz(h, X16, VFC_FLASH_BASE >> 16, 1);
     a64_sub(h, X16, 0, X16, SH_LSL, 0);
-    a64_lsr_imm(h, X17, X16, 21);
+    a64_lsr_imm(h, X17, X16, VFC_FLASH_BITS);
     const uint32_t miss1 = h->count;
     a64(h, a64_cbnz(X17, 0));
     a64_lsr_imm(h, X16, X16, 1);
@@ -314,9 +314,8 @@ static void flags_nzc(tr_t *t, int res, int carry)
 
 // --- Memory
 
-#define RAM_BITS 19
-#define FLASH_BITS 21
-_Static_assert(VFC_RAM_SIZE == 1u << RAM_BITS && VFC_FLASH_SIZE == 1u << FLASH_BITS, "regions are tested by shifting");
+// RAM and flash are powers of two in size (VFC_RAM_BITS, VFC_FLASH_BITS),
+// so an offset into either is tested with a shift.
 _Static_assert((VFC_RAM_BASE & 0xFFFF) == 0 && (VFC_FLASH_BASE & 0xFFFF) == 0, "region bases load with one MOVZ");
 
 // Leaves the offset of the address in `addr` from `base` in w16, and returns
@@ -346,7 +345,7 @@ static uint32_t outside(a64_buf_t *b, int addr, uint32_t base, int bits, int siz
 static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst, int sreg)
 {
     a64_buf_t *h = &t->hot, *c = &t->cold;
-    branch_hot_to_cold(t, outside(h, addr, VFC_RAM_BASE, RAM_BITS, size), c->count);
+    branch_hot_to_cold(t, outside(h, addr, VFC_RAM_BASE, VFC_RAM_BITS, size), c->count);
     if (store) {
         switch (size) {
         case 1: a64_strb_uxtw(h, dst, RAMB, X16); break;
@@ -364,7 +363,7 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst, 
 
     // Cold: flash.
     if (!store) {
-        const uint32_t notFlash = outside(c, addr, VFC_FLASH_BASE, FLASH_BITS, size);
+        const uint32_t notFlash = outside(c, addr, VFC_FLASH_BASE, VFC_FLASH_BITS, size);
         const uint32_t toMmio = c->count;
         a64(c, notFlash);
         a64_ldr_x_imm(c, X17, CTX, OFF(jitFlash));
@@ -454,11 +453,11 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst, 
 static void ram_range(tr_t *t, int addr, uint32_t bytes)
 {
     a64_buf_t *h = &t->hot;
-    a64_movz(h, X16, 0x2000, 1);
+    a64_movz(h, X16, VFC_RAM_BASE >> 16, 1);
     a64_sub(h, X16, addr, X16, SH_LSL, 0);
     a64_add_imm(h, X17, X16, bytes - 1, false);
     a64_orr(h, X17, X17, X16, SH_LSL, 0);
-    a64_lsr_imm(h, X17, X17, 19);
+    a64_lsr_imm(h, X17, X17, VFC_RAM_BITS);
     branch_hot_to_cold(t, a64_cbnz(X17, 0), interpret_stub(t));
 }
 
@@ -1871,9 +1870,9 @@ static bool emit_shared(struct vfc_jit *jit)
 
     // dispatch: w0 = guest pc
     jit->dispatch = b.count;
-    a64_movz(&b, X16, 0x0800, 1);
+    a64_movz(&b, X16, VFC_FLASH_BASE >> 16, 1);
     a64_sub(&b, X16, 0, X16, SH_LSL, 0);
-    a64_lsr_imm(&b, X17, X16, 21);
+    a64_lsr_imm(&b, X17, X16, VFC_FLASH_BITS);
     const uint32_t miss1 = b.count;
     a64(&b, a64_cbnz(X17, 0));
     a64_lsr_imm(&b, X16, X16, 1);

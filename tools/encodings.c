@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Development check: the JIT's AArch64 encoder against the system assembler.
+// Development check: the JIT's AArch64 encoder against the system assembler
+// (on macOS) or LLVM's (elsewhere: clang and llvm-objcopy).
 //   cc -ISources/VFC tools/encodings.c -o /tmp/encodings && /tmp/encodings
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,6 +71,9 @@ int main(void)
     T("sub w1, w2, #255", a64_sub_imm(&b, 1, 2, 255, false));
     T("subs wzr, w2, #200", a64_subs_imm(&b, 31, 2, 200));
     T("add x16, x16, #12", a64_add_x_imm(&b, 16, 16, 12));
+    T("add x17, x16, #3", a64_add_x_imm(&b, 17, 16, 3));
+    T("lsr x17, x17, #19", a64_lsr_x_imm(&b, 17, 17, 19));
+    T("lsr x17, x17, #21", a64_lsr_x_imm(&b, 17, 17, 21));
     T("sub x16, x16, #48", a64_sub_x_imm(&b, 16, 16, 48));
     T("movz w1, #0x2000, lsl #16", a64_movz(&b, 1, 0x2000, 1));
     T("movk w1, #0x1234, lsl #16", a64_movk(&b, 1, 0x1234, 1));
@@ -84,6 +88,7 @@ int main(void)
     T("and w16, w16, #0xf0000000", a64_and_imm(&b, 16, 16, 0xF0000000u));
     T("and w1, w1, #0x55555555", a64_and_imm(&b, 1, 1, 0x55555555u));
     T("and w1, w1, #0x00ff00ff", a64_and_imm(&b, 1, 1, 0x00FF00FFu));
+    T("and w17, w16, #0xfffffff3", a64_and_imm(&b, 17, 16, ~(uint32_t)0xC));
     T("mrs x16, nzcv", a64_mrs_nzcv(&b, 16));
     T("msr nzcv, x17", a64_msr_nzcv(&b, 17));
     T("br x16", a64_br(&b, 16));
@@ -137,9 +142,14 @@ int main(void)
     fputs(".text\n", f);
     fputs(text, f);
     fclose(f);
+#ifdef __APPLE__
     if (system("clang -c /tmp/vfc-enc.s -o /tmp/vfc-enc.o && otool -tvX /tmp/vfc-enc.o > /dev/null && "
                "objcopy -O binary --only-section=__TEXT,__text /tmp/vfc-enc.o /tmp/vfc-enc.bin 2>/dev/null || "
                "segedit /tmp/vfc-enc.o -extract __TEXT __text /tmp/vfc-enc.bin") != 0) {
+#else
+    if (system("clang --target=aarch64-linux-gnu -c /tmp/vfc-enc.s -o /tmp/vfc-enc.o && "
+               "llvm-objcopy -O binary --only-section=.text /tmp/vfc-enc.o /tmp/vfc-enc.bin") != 0) {
+#endif
         fprintf(stderr, "assembling failed\n");
     }
     FILE *bin = fopen("/tmp/vfc-enc.bin", "rb");

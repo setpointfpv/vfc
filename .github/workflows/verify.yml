@@ -1,0 +1,63 @@
+# Tests, fuzzing and proofs for the core. What each establishes, and what it
+# relies on, is in docs/verification.md; `make check` runs them all locally.
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux, JIT emulated
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libunicorn-dev llvm clang
+          pip install z3-solver unicorn
+      - name: Regression tests, under ASan and UBSan
+        run: make test
+      - name: Floating point against Unicorn's Cortex-M4
+        run: make fpu
+      - name: Encoder against LLVM's assembler
+        run: make encodings
+      - name: JIT against the interpreter
+        run: make fuzz
+      - name: JIT translations proved against the Thumb spec
+        run: make prove
+
+  cbmc:
+    name: CBMC ${{ matrix.harness }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [load, restore, bus, logical_imm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cbmc
+      - run: make cbmc-${{ matrix.harness }}
+
+  apple-silicon:
+    name: Apple silicon, JIT native
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install unicorn
+      - run: swift build
+      - name: Regression tests, under ASan and UBSan
+        run: make test
+      - name: Floating point against Unicorn's Cortex-M4
+        run: make fpu UNICORN="-I$(brew --prefix)/include -L$(brew --prefix)/lib -lunicorn"
+      - name: Encoder against the system assembler
+        run: make encodings
+      - name: JIT against the interpreter
+        run: make fuzz

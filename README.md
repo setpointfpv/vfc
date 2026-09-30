@@ -19,4 +19,5 @@ the only interface between them is the mailbox register map (`docs/abi.md`).
 | `Sources/VFC/board.c` | Memory map, mailbox, loader and stepping |
 | `Sources/VFC/jit.c`, `jit_emit.h` | Thumb-2 to AArch64 translation (`docs/jit.md`) |
 | `Sources/VirtualFC/` | The Swift wrapper |
-| `tools/` | Development tools: a runner, differential tests against Unicorn (never linked), the JIT against the interpreter, and an encoder check |
+| `tools/` | Development tools: a runner, differential tests against Unicorn (never linked), the JIT against the interpreter (on firmware, and fuzzed), the JIT emulated for other hosts, and an encoder check |
+| `tests/`, `Makefile` | Regression tests and proofs; `make check` (`docs/verification.md`) |

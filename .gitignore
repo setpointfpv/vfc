@@ -7,3 +7,4 @@ tools/jitdiff
 tools/encodings
 *.dSYM/
 tools/jitfuzz
+__pycache__/

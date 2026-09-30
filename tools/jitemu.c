@@ -47,12 +47,11 @@ typedef struct {
 } range_t;
 static range_t allowed[5];
 static int nallowed;
-static vfc_t *current;
 static char violation[160];
 
-// Page runs already mapped into Unicorn.
-static range_t mapped[64];
-static int nmapped;
+// Page runs mapped into Unicorn: whatever the runs so far have needed.
+static range_t *mapped;
+static int nmapped, mappedCap;
 
 static void fail(uc_err err, const char *what)
 {
@@ -92,13 +91,45 @@ static void map_host(uint64_t start, uint64_t end)
                 runEnd += PAGE;
             }
         }
-        if (nmapped == (int)(sizeof(mapped) / sizeof(mapped[0]))) {
-            fprintf(stderr, "jitemu: too many mappings\n");
-            exit(1);
+        if (nmapped == mappedCap) {
+            mappedCap = mappedCap ? mappedCap * 2 : 16;
+            mapped = realloc(mapped, (size_t)mappedCap * sizeof(*mapped));
+            if (!mapped) {
+                fprintf(stderr, "jitemu: out of memory\n");
+                exit(1);
+            }
         }
         fail(uc_mem_map_ptr(uc, page, runEnd - page, UC_PROT_ALL, (void *)(uintptr_t)page), "map");
         mapped[nmapped++] = (range_t){ page, runEnd, "" };
         page = runEnd;
+    }
+}
+
+static bool overlaps(const range_t *r, uint64_t start, uint64_t end)
+{
+    return r->start < end && start < r->end;
+}
+
+// Boards come and go, and their memory with them: unmaps what no longer
+// overlaps anything this run may use. Unicorn keeps what it translated from
+// memory it unmaps, and a flush of memory it doesn't map does nothing, so
+// code a later board wrote at the same addresses would run as the old one:
+// what it translated from each mapping goes first.
+static void unmap_stale(uint64_t codeStart, uint64_t codeEnd)
+{
+    for (int i = 0; i < nmapped;) {
+        bool live = overlaps(&mapped[i], codeStart, codeEnd)
+                 || overlaps(&mapped[i], (uintptr_t)helperCode, (uintptr_t)helperCode + PAGE);
+        for (int k = 0; k < nallowed && !live; k++) {
+            live = overlaps(&mapped[i], allowed[k].start & ~(uint64_t)(PAGE - 1), allowed[k].end);
+        }
+        if (live) {
+            i++;
+            continue;
+        }
+        fail(uc_ctl_remove_cache(uc, mapped[i].start, mapped[i].end), "flush");
+        fail(uc_mem_unmap(uc, mapped[i].start, mapped[i].end - mapped[i].start), "unmap");
+        mapped[i] = mapped[--nmapped];
     }
 }
 
@@ -204,20 +235,29 @@ void *vfc_jit_emulated_helper(int which, void *function)
 void vfc_jit_emulated_flush(void *code, size_t length)
 {
     init();
-    // The code cache was written behind Unicorn's back: drop what it translated.
-    fail(uc_ctl_remove_cache(uc, (uintptr_t)code, (uintptr_t)code + length), "flush");
+    // The code cache was written behind Unicorn's back: drop what it
+    // translated, one mapping at a time, since Unicorn finds a range from its
+    // first address. Memory not mapped has nothing translated (unmap_stale).
+    const uint64_t start = (uintptr_t)code, end = start + length;
+    for (int i = 0; i < nmapped; i++) {
+        const uint64_t from = start > mapped[i].start ? start : mapped[i].start;
+        const uint64_t to = end < mapped[i].end ? end : mapped[i].end;
+        if (from < to) {
+            fail(uc_ctl_remove_cache(uc, from, to), "flush");
+        }
+    }
 }
 
 bool vfc_jit_emulated_enter(vfc_t *vfc, void *code, size_t codeBytes, void *enter, void *block)
 {
     init();
-    current = vfc;
     nallowed = 0;
     allowed[nallowed++] = (range_t){ (uintptr_t)vfc, (uintptr_t)vfc + sizeof(vfc_t), "board" };
     allowed[nallowed++] = (range_t){ (uintptr_t)vfc->ram, (uintptr_t)vfc->ram + VFC_RAM_SIZE, "RAM" };
     allowed[nallowed++] = (range_t){ (uintptr_t)vfc->flash, (uintptr_t)vfc->flash + VFC_FLASH_SIZE, "flash" };
     allowed[nallowed++] = (range_t){ (uintptr_t)vfc->jitTable, (uintptr_t)vfc->jitTable + VFC_FLASH_SIZE / 2 * sizeof(void *), "table" };
     allowed[nallowed++] = (range_t){ (uintptr_t)stack, (uintptr_t)stack + STACK_BYTES, "stack" };
+    unmap_stale((uintptr_t)code, (uintptr_t)code + codeBytes);
     for (int i = 0; i < nallowed; i++) {
         map_host(allowed[i].start, allowed[i].end);
     }

@@ -183,7 +183,7 @@ static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
     case MBX_SERIAL_TX_DATA: fifo_push(&vfc->fromGuest, (uint8_t)value); return;
     case MBX_BLACKBOX_DATA:
         if (vfc->blackboxLength == vfc->blackboxCapacity) {
-            const size_t capacity = vfc->blackboxCapacity ? vfc->blackboxCapacity * 2 : 1 << 20;
+            const size_t capacity = vfc->blackboxCapacity ? vfc->blackboxCapacity * 2 : VFC_BLACKBOX_CHUNK;
             uint8_t *grown = realloc(vfc->blackbox, capacity);
             if (!grown) {
                 return;
