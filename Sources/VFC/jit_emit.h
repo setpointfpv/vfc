@@ -14,7 +14,10 @@ typedef struct {
     uint32_t *code;
     uint32_t count;
     uint32_t capacity;
-    bool overflow;
+    // Something couldn't be emitted as asked: the buffer filled up, an
+    // immediate had no encoding, or a branch couldn't reach its target. The
+    // code is wrong and must be thrown away.
+    bool failed;
 } a64_buf_t;
 
 static inline void a64(a64_buf_t *b, uint32_t insn)
@@ -22,7 +25,7 @@ static inline void a64(a64_buf_t *b, uint32_t insn)
     if (b->count < b->capacity) {
         b->code[b->count++] = insn;
     } else {
-        b->overflow = true;
+        b->failed = true;
     }
 }
 
@@ -116,6 +119,7 @@ static inline void a64_bfm(a64_buf_t *b, int d, int n, int immr, int imms)
 }
 static inline void a64_lsl_imm(a64_buf_t *b, int d, int n, int s) { a64_ubfm(b, d, n, (32 - s) & 31, 31 - s); }
 static inline void a64_lsr_imm(a64_buf_t *b, int d, int n, int s) { a64_ubfm(b, d, n, s, 31); }
+static inline void a64_lsr_x_imm(a64_buf_t *b, int d, int n, int s) { a64_ubfm_x(b, d, n, s, 63); }
 static inline void a64_asr_imm(a64_buf_t *b, int d, int n, int s) { a64_sbfm(b, d, n, s, 31); }
 static inline void a64_ror_imm(a64_buf_t *b, int d, int n, int s)
 {
@@ -231,19 +235,17 @@ static inline bool a64_logical_imm(uint32_t value, uint32_t *encoding)
     return false;
 }
 
-static inline bool a64_and_imm(a64_buf_t *b, int d, int n, uint32_t value)
+static inline void a64_and_imm(a64_buf_t *b, int d, int n, uint32_t value)
 {
     uint32_t e;
-    if (!a64_logical_imm(value, &e)) return false;
+    if (!a64_logical_imm(value, &e)) { b->failed = true; return; }
     a64(b, 0x12000000u | e | ((uint32_t)n << 5) | (uint32_t)d);
-    return true;
 }
-static inline bool a64_orr_imm(a64_buf_t *b, int d, int n, uint32_t value)
+static inline void a64_orr_imm(a64_buf_t *b, int d, int n, uint32_t value)
 {
     uint32_t e;
-    if (!a64_logical_imm(value, &e)) return false;
+    if (!a64_logical_imm(value, &e)) { b->failed = true; return; }
     a64(b, 0x32000000u | e | ((uint32_t)n << 5) | (uint32_t)d);
-    return true;
 }
 
 // --- System
@@ -258,6 +260,7 @@ static inline uint32_t a64_bcond(int cond, int32_t offset) { return 0x54000000u 
 static inline uint32_t a64_cbz(int t, int32_t offset)  { return 0x34000000u | (((uint32_t)offset & 0x7FFFF) << 5) | (uint32_t)t; }
 static inline uint32_t a64_cbnz(int t, int32_t offset) { return 0x35000000u | (((uint32_t)offset & 0x7FFFF) << 5) | (uint32_t)t; }
 static inline uint32_t a64_cbz_x(int t, int32_t offset)  { return 0xB4000000u | (((uint32_t)offset & 0x7FFFF) << 5) | (uint32_t)t; }
+static inline uint32_t a64_cbnz_x(int t, int32_t offset) { return 0xB5000000u | (((uint32_t)offset & 0x7FFFF) << 5) | (uint32_t)t; }
 static inline uint32_t a64_tbz(int t, int bit, int32_t offset)
 {
     return 0x36000000u | ((uint32_t)(bit >> 5) << 31) | ((uint32_t)(bit & 31) << 19) | (((uint32_t)offset & 0x3FFF) << 5) | (uint32_t)t;
@@ -270,21 +273,38 @@ static inline void a64_br(a64_buf_t *b, int n)  { a64(b, 0xD61F0000u | ((uint32_
 static inline void a64_blr(a64_buf_t *b, int n) { a64(b, 0xD63F0000u | ((uint32_t)n << 5)); }
 static inline void a64_ret(a64_buf_t *b)        { a64(b, 0xD65F03C0u); }
 
-// Re-targets a branch at `at` to `target` (both indices in the same buffer).
-static inline void a64_patch(uint32_t *code, uint32_t at, uint32_t target)
+// Whether a branch can reach `offset` instructions away: B and BL have 26
+// bits of offset, B.cond, CBZ and CBNZ 19, TBZ and TBNZ only 14.
+static inline bool a64_reaches(uint32_t insn, int64_t offset)
 {
-    const int32_t offset = (int32_t)target - (int32_t)at;
-    uint32_t insn = code[at];
-    if ((insn & 0x7C000000u) == 0x14000000u) {                 // B, BL
-        insn = (insn & 0xFC000000u) | ((uint32_t)offset & 0x03FFFFFFu);
-    } else if ((insn & 0xFF000010u) == 0x54000000u) {          // B.cond
-        insn = (insn & 0xFF00001Fu) | (((uint32_t)offset & 0x7FFFF) << 5);
-    } else if ((insn & 0x7E000000u) == 0x34000000u) {          // CBZ, CBNZ
-        insn = (insn & 0xFF00001Fu) | (((uint32_t)offset & 0x7FFFF) << 5);
-    } else if ((insn & 0x7E000000u) == 0x36000000u) {          // TBZ, TBNZ
-        insn = (insn & 0xFFF8001Fu) | (((uint32_t)offset & 0x3FFF) << 5);
+    int bits = 0;
+    if ((insn & 0x7C000000u) == 0x14000000u) bits = 26;                                               // B, BL
+    else if ((insn & 0xFF000010u) == 0x54000000u || (insn & 0x7E000000u) == 0x34000000u) bits = 19;   // B.cond, CBZ, CBNZ
+    else if ((insn & 0x7E000000u) == 0x36000000u) bits = 14;                                          // TBZ, TBNZ
+    return bits && offset >= -((int64_t)1 << (bits - 1)) && offset < ((int64_t)1 << (bits - 1));
+}
+
+// A branch instruction with its offset replaced. Only for offsets it reaches.
+static inline uint32_t a64_with_offset(uint32_t insn, int32_t offset)
+{
+    if ((insn & 0x7C000000u) == 0x14000000u) {
+        return (insn & 0xFC000000u) | ((uint32_t)offset & 0x03FFFFFFu);
     }
-    code[at] = insn;
+    if ((insn & 0xFF000010u) == 0x54000000u || (insn & 0x7E000000u) == 0x34000000u) {
+        return (insn & 0xFF00001Fu) | (((uint32_t)offset & 0x7FFFF) << 5);
+    }
+    return (insn & 0xFFF8001Fu) | (((uint32_t)offset & 0x3FFF) << 5);
+}
+
+// Re-targets the branch at `at` to `target`, both indices in `b`.
+static inline void a64_patch(a64_buf_t *b, uint32_t at, uint32_t target)
+{
+    const int64_t offset = (int64_t)target - (int64_t)at;
+    if (!a64_reaches(b->code[at], offset)) {
+        b->failed = true;
+        return;
+    }
+    b->code[at] = a64_with_offset(b->code[at], (int32_t)offset);
 }
 
 // --- Loads and stores

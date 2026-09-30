@@ -1184,21 +1184,24 @@ static void multiply(ctx_t *x, uint32_t hw1, uint32_t hw2)
         }
         return;
     }
+    // The most significant word multiplies work modulo 2^64: bits 63:32 come
+    // out as the pseudocode's unbounded arithmetic has them, and nothing
+    // overflows a signed type.
     case 5: {                               // SMMLA, SMMUL
-        int64_t result = (int64_t)(int32_t)rn * (int32_t)rm;
+        uint64_t result = (uint64_t)((int64_t)(int32_t)rn * (int32_t)rm);
         if (a != 15) {
-            result += (int64_t)((uint64_t)cpu->r[a] << 32);
+            result += (uint64_t)cpu->r[a] << 32;
         }
         if (hw2 & 0x10) {
-            result += 0x80000000LL;
+            result += 0x80000000u;
         }
         cpu->r[d] = (uint32_t)(result >> 32);
         return;
     }
     case 6: {                               // SMMLS
-        int64_t result = (int64_t)((uint64_t)cpu->r[a] << 32) - (int64_t)(int32_t)rn * (int32_t)rm;
+        uint64_t result = ((uint64_t)cpu->r[a] << 32) - (uint64_t)((int64_t)(int32_t)rn * (int32_t)rm);
         if (hw2 & 0x10) {
-            result += 0x80000000LL;
+            result += 0x80000000u;
         }
         cpu->r[d] = (uint32_t)(result >> 32);
         return;
@@ -1334,6 +1337,68 @@ static inline void set_sreg(vfc_cpu_t *cpu, unsigned i, float v)
     cpu->s.f[i] = v;
 }
 
+// Results as Arm defines them. IEEE 754 settles every one but a NaN's sign
+// and payload, which it leaves to the host: x86's default NaN is negative,
+// and compilers turn d + -p into d - p. So the arithmetic is the host's, but
+// a NaN it produces is replaced by Arm's (FPProcessNaNs): the first
+// signalling NaN among the operands, made quiet, else the first quiet one,
+// else the default NaN, when the operands were numbers. FPNeg flips the sign
+// of anything, NaNs too. FPSCR's DN, FZ and rounding mode stay unmodelled:
+// firmware leaves them clear.
+
+#define SIGN 0x80000000u
+#define QUIET 0x00400000u
+#define DEFAULT_NAN 0x7FC00000u
+
+static inline float as_float(uint32_t u)
+{
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+static inline bool is_nan(uint32_t u)
+{
+    return (u & ~SIGN) > 0x7F800000u;
+}
+
+static uint32_t arm_result(float result, const uint32_t *ops, int n)
+{
+    uint32_t u;
+    memcpy(&u, &result, 4);
+    if (!is_nan(u)) {
+        return u;
+    }
+    for (int i = 0; i < n; i++) {
+        if (is_nan(ops[i]) && !(ops[i] & QUIET)) {
+            return ops[i] | QUIET;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (is_nan(ops[i])) {
+            return ops[i];
+        }
+    }
+    return DEFAULT_NAN;
+}
+
+static uint32_t fp_add(uint32_t a, uint32_t b) { return arm_result(as_float(a) + as_float(b), (const uint32_t[]){ a, b }, 2); }
+static uint32_t fp_sub(uint32_t a, uint32_t b) { return arm_result(as_float(a) - as_float(b), (const uint32_t[]){ a, b }, 2); }
+static uint32_t fp_mul(uint32_t a, uint32_t b) { return arm_result(as_float(a) * as_float(b), (const uint32_t[]){ a, b }, 2); }
+static uint32_t fp_div(uint32_t a, uint32_t b) { return arm_result(as_float(a) / as_float(b), (const uint32_t[]){ a, b }, 2); }
+static uint32_t fp_sqrt(uint32_t a) { return arm_result(sqrtf(as_float(a)), &a, 1); }
+
+// FPMulAdd: addend + op1 * op2, rounded once. A quiet NaN addend gives way to
+// the default NaN when the product is infinity times zero.
+static uint32_t fp_muladd(uint32_t addend, uint32_t op1, uint32_t op2)
+{
+    const uint32_t a = op1 & ~SIGN, b = op2 & ~SIGN;
+    if (is_nan(addend) && (addend & QUIET) && ((a == 0x7F800000u && b == 0) || (a == 0 && b == 0x7F800000u))) {
+        return DEFAULT_NAN;
+    }
+    return arm_result(fmaf(as_float(op1), as_float(op2), as_float(addend)), (const uint32_t[]){ addend, op1, op2 }, 3);
+}
+
 static uint32_t vfp_expand_imm(uint32_t imm8)
 {
     const uint32_t sign = (imm8 >> 7) & 1;
@@ -1400,38 +1465,37 @@ static void vfp_data_processing(ctx_t *x, uint32_t inst)
     const bool op = (inst >> 6) & 1;
     const unsigned opc1 = (((inst >> 23) & 1) << 2) | ((inst >> 20) & 3);
 
+    uint32_t *s = cpu->s.u;
     switch (opc1) {
     case 0: {                               // VMLA, VMLS
-        const float product = sreg(cpu, n) * sreg(cpu, m);
-        set_sreg(cpu, d, sreg(cpu, d) + (op ? -product : product));
+        const uint32_t product = fp_mul(s[n], s[m]);
+        s[d] = fp_add(s[d], op ? product ^ SIGN : product);
         return;
     }
     case 1: {                               // VNMLS, VNMLA
-        const float product = sreg(cpu, n) * sreg(cpu, m);
-        set_sreg(cpu, d, op ? -sreg(cpu, d) - product : -sreg(cpu, d) + product);
+        const uint32_t product = fp_mul(s[n], s[m]);
+        s[d] = fp_add(s[d] ^ SIGN, op ? product ^ SIGN : product);
         return;
     }
     case 2: {                               // VMUL, VNMUL
-        const float product = sreg(cpu, n) * sreg(cpu, m);
-        set_sreg(cpu, d, op ? -product : product);
+        const uint32_t product = fp_mul(s[n], s[m]);
+        s[d] = op ? product ^ SIGN : product;
         return;
     }
     case 3:                                 // VADD, VSUB
-        set_sreg(cpu, d, op ? sreg(cpu, n) - sreg(cpu, m) : sreg(cpu, n) + sreg(cpu, m));
+        s[d] = op ? fp_sub(s[n], s[m]) : fp_add(s[n], s[m]);
         return;
     case 4:                                 // VDIV
         if (op) {
             break;
         }
-        set_sreg(cpu, d, sreg(cpu, n) / sreg(cpu, m));
+        s[d] = fp_div(s[n], s[m]);
         return;
     case 5:                                 // VFNMS, VFNMA
-        set_sreg(cpu, d, op ? fmaf(-sreg(cpu, n), sreg(cpu, m), -sreg(cpu, d))
-                            : fmaf(sreg(cpu, n), sreg(cpu, m), -sreg(cpu, d)));
+        s[d] = fp_muladd(s[d] ^ SIGN, op ? s[n] ^ SIGN : s[n], s[m]);
         return;
     case 6:                                 // VFMA, VFMS
-        set_sreg(cpu, d, op ? fmaf(-sreg(cpu, n), sreg(cpu, m), sreg(cpu, d))
-                            : fmaf(sreg(cpu, n), sreg(cpu, m), sreg(cpu, d)));
+        s[d] = fp_muladd(s[d], op ? s[n] ^ SIGN : s[n], s[m]);
         return;
     case 7: {
         const unsigned opc2 = (inst >> 16) & 0xF, opc3 = (inst >> 6) & 3;
@@ -1451,7 +1515,7 @@ static void vfp_data_processing(ctx_t *x, uint32_t inst)
             if (opc3 == 1) {
                 cpu->s.u[d] = cpu->s.u[m] ^ 0x80000000u;
             } else {
-                set_sreg(cpu, d, sqrtf(sreg(cpu, m)));
+                cpu->s.u[d] = fp_sqrt(cpu->s.u[m]);
             }
             return;
         case 0x4:                           // VCMP{E} register
@@ -1564,6 +1628,10 @@ static void vfp(ctx_t *x, uint32_t hw1, uint32_t hw2)
         const uint32_t base = n == 15 ? align4(x->pc + 4) : cpu->r[n];
         const uint32_t address = add ? base + imm8 * 4 : base - imm8 * 4;
         const unsigned words = doubleRegs ? 2 : 1;
+        if (first + words > 32) {           // D16-D31, which FPv4-SP doesn't have
+            undefined(x, inst, true);
+            return;
+        }
         for (unsigned i = 0; i < words; i++) {
             if (isLoad) {
                 cpu->s.u[first + i] = load(vfc, address + 4 * i, 4);
@@ -1731,6 +1799,7 @@ void vfc_cpu_run(vfc_t *vfc, uint64_t budget)
 
     while (budget-- > 0 && !vfc->stopRequested) {
         const uint32_t pc = cpu->r[15];
+        vfc->instructionPc = pc;            // before the fetch, which can fault too
         const uint32_t hw1 = fetch16(vfc, pc);
         const bool wide = (hw1 >> 11) >= 0x1D;
         const uint32_t hw2 = wide ? fetch16(vfc, pc + 2) : 0;

@@ -30,11 +30,29 @@
 
 #include "vfc_internal.h"
 
-#if defined(__aarch64__) && defined(__APPLE__)
+#if (defined(__aarch64__) && defined(__APPLE__)) || defined(VFC_JIT_EMULATED)
 
+#include <sys/mman.h>
+
+#ifdef VFC_JIT_EMULATED
+// Development builds on other hosts: the generated code runs in an AArch64
+// emulator (tools/jitemu.c), which provides these. The code cache is plain
+// memory there, which the host never executes (Apple silicon wouldn't map
+// it writable and executable without MAP_JIT), and the emulator is told
+// whenever code in it changes.
+bool vfc_jit_emulated_enter(vfc_t *vfc, void *code, size_t codeBytes, void *enter, void *block);
+void *vfc_jit_emulated_helper(int which, void *function);
+void vfc_jit_emulated_flush(void *code, size_t length);
+#undef MAP_JIT
+#define MAP_JIT 0
+#define CACHE_PROT (PROT_READ | PROT_WRITE)
+#define pthread_jit_write_protect_np(writable) ((void)(writable))
+#define sys_icache_invalidate(code, length) vfc_jit_emulated_flush(code, length)
+#else
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
-#include <sys/mman.h>
+#define CACHE_PROT (PROT_READ | PROT_WRITE | PROT_EXEC)
+#endif
 
 #include "jit_emit.h"
 
@@ -43,6 +61,12 @@
 #define HOT_CAP 8192
 #define COLD_CAP 16384
 #define MAX_FIXUPS 2048
+
+// Blocks branch to one another with B, which reaches anywhere in the cache;
+// inside a block B.cond, CBZ and CBNZ always reach. TBZ and TBNZ may not, and
+// a block with one that doesn't is thrown away (a64_reaches).
+_Static_assert(CACHE_INSNS <= (1u << 25), "B reaches anywhere in the cache");
+_Static_assert(HOT_CAP + COLD_CAP <= (1u << 18), "B.cond, CBZ and CBNZ reach anywhere in a block");
 
 enum { EXIT_NORMAL = 0, EXIT_INTERPRET = 1, EXIT_BUDGET = 2, EXIT_WFI = 3, EXIT_STOP = 4 };
 
@@ -61,6 +85,7 @@ _Static_assert(offsetof(vfc_t, jitRam) % 8 == 0, "8-aligned for LDR X");
 _Static_assert(offsetof(vfc_t, jitLoad) % 8 == 0, "8-aligned for LDR X");
 _Static_assert(offsetof(vfc_t, jitStore) % 8 == 0, "8-aligned for LDR X");
 _Static_assert(offsetof(vfc_t, stopReason) < 4096, "within LDR W range");
+_Static_assert(offsetof(vfc_t, instructionPc) < 16384 && offsetof(vfc_t, instructionPc) % 4 == 0, "within STR W range");
 _Static_assert(offsetof(vfc_t, timeRegs) < 4096, "within ADD immediate range");
 
 struct vfc_jit {
@@ -153,20 +178,6 @@ static void branch_to_cache(tr_t *t, bool cold, uint32_t insn, uint32_t cacheTar
     fixup(t, cold, b->count - 1, 2, cacheTarget);
 }
 
-static uint32_t set_offset(uint32_t insn, int32_t offset)
-{
-    if ((insn & 0x7C000000u) == 0x14000000u) {
-        return (insn & 0xFC000000u) | ((uint32_t)offset & 0x03FFFFFFu);
-    }
-    if ((insn & 0xFF000010u) == 0x54000000u || (insn & 0x7E000000u) == 0x34000000u) {
-        return (insn & 0xFF00001Fu) | (((uint32_t)offset & 0x7FFFF) << 5);
-    }
-    if ((insn & 0x7E000000u) == 0x36000000u) {
-        return (insn & 0xFFF8001Fu) | (((uint32_t)offset & 0x3FFF) << 5);
-    }
-    return insn;
-}
-
 // Leaves generated code: pc and exit kind for the C loop. `addback` says how
 // much of the block's instruction budget to return: -1 none (not yet taken),
 // 0 when this instruction has not run, 1 when it has.
@@ -238,9 +249,9 @@ static void goto_w0(tr_t *t)
     // The table lookup, here rather than in one shared stub, so that each
     // indirect branch has its own `br` for the predictor to learn.
     a64_buf_t *h = &t->hot;
-    a64_movz(h, X16, 0x0800, 1);
+    a64_movz(h, X16, VFC_FLASH_BASE >> 16, 1);
     a64_sub(h, X16, 0, X16, SH_LSL, 0);
-    a64_lsr_imm(h, X17, X16, 21);
+    a64_lsr_imm(h, X17, X16, VFC_FLASH_BITS);
     const uint32_t miss1 = h->count;
     a64(h, a64_cbnz(X17, 0));
     a64_lsr_imm(h, X16, X16, 1);
@@ -249,8 +260,8 @@ static void goto_w0(tr_t *t)
     const uint32_t miss2 = h->count;
     a64(h, a64_cbz_x(X16, 0));
     a64_br(h, X16);
-    a64_patch(h->code, miss1, h->count);
-    a64_patch(h->code, miss2, h->count);
+    a64_patch(h, miss1, h->count);
+    a64_patch(h, miss2, h->count);
     branch_to_cache(t, false, a64_b(0), t->jit->dispatch);
 }
 
@@ -308,16 +319,38 @@ static void flags_nzc(tr_t *t, int res, int carry)
 
 // --- Memory
 
+// RAM and flash are powers of two in size (VFC_RAM_BITS, VFC_FLASH_BITS),
+// so an offset into either is tested with a shift.
+_Static_assert((VFC_RAM_BASE & 0xFFFF) == 0 && (VFC_FLASH_BASE & 0xFFFF) == 0, "region bases load with one MOVZ");
+
+// Leaves the offset of the address in `addr` from `base` in w16, and returns
+// the branch (offset still to fill in) to take when the `size` bytes there
+// aren't all within the 2^bits bytes from `base`. The last byte's offset is
+// worked out in 64 bits, where it can't wrap round (writing w16 cleared the
+// top of x16), so an access running off either end of the region is caught.
+static uint32_t outside(a64_buf_t *b, int addr, uint32_t base, int bits, int size)
+{
+    a64_movz(b, X16, base >> 16, 1);
+    a64_sub(b, X16, addr, X16, SH_LSL, 0);
+    if (size == 1) {
+        a64_lsr_imm(b, X17, X16, bits);
+        return a64_cbnz(X17, 0);
+    }
+    a64_add_x_imm(b, X17, X16, (uint32_t)size - 1);
+    a64_lsr_x_imm(b, X17, X17, bits);
+    return a64_cbnz_x(X17, 0);
+}
+
 // Loads `size` bytes from the guest address in `addr` into `dst`, or stores
 // `dst` there. Fast path: RAM, inline. Cold: flash for loads, then the C
-// helper, which reaches the mailbox and faults on anything unmapped.
-static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
+// helper, which reaches the mailbox and faults on anything unmapped. A load
+// that faults leaves 0 in its destination, as the interpreter's does; `sreg`
+// (-1 for none) is a floating point register the value goes on to, which
+// gets it before the fault stops the core too.
+static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst, int sreg)
 {
     a64_buf_t *h = &t->hot, *c = &t->cold;
-    a64_movz(h, X16, 0x2000, 1);
-    a64_sub(h, X16, addr, X16, SH_LSL, 0);
-    a64_lsr_imm(h, X17, X16, 19);
-    branch_hot_to_cold(t, a64_cbnz(X17, 0), c->count);
+    branch_hot_to_cold(t, outside(h, addr, VFC_RAM_BASE, VFC_RAM_BITS, size), c->count);
     if (store) {
         switch (size) {
         case 1: a64_strb_uxtw(h, dst, RAMB, X16); break;
@@ -335,11 +368,9 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
 
     // Cold: flash.
     if (!store) {
-        a64_movz(c, X16, 0x0800, 1);
-        a64_sub(c, X16, addr, X16, SH_LSL, 0);
-        a64_lsr_imm(c, X17, X16, 21);
+        const uint32_t notFlash = outside(c, addr, VFC_FLASH_BASE, VFC_FLASH_BITS, size);
         const uint32_t toMmio = c->count;
-        a64(c, a64_cbnz(X17, 0));
+        a64(c, notFlash);
         a64_ldr_x_imm(c, X17, CTX, OFF(jitFlash));
         switch (size) {
         case 1: if (sign) a64_ldrsb_uxtw(c, dst, X17, X16); else a64_ldrb_uxtw(c, dst, X17, X16); break;
@@ -347,7 +378,7 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
         default: a64_ldr_uxtw(c, dst, X17, X16); break;
         }
         branch_cold_to_hot(t, a64_b(0), back);
-        a64_patch(c->code, toMmio, c->count);
+        a64_patch(c, toMmio, c->count);
     }
 
     // Cold: the mailbox's time registers, read directly, since the firmware
@@ -361,7 +392,7 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
         a64_add_x_imm(c, X17, CTX, OFF(timeRegs));
         a64_ldr_uxtw(c, dst, X17, X16);
         branch_cold_to_hot(t, a64_b(0), back);
-        a64_patch(c->code, notTime, c->count);
+        a64_patch(c, notTime, c->count);
     }
 
     // Cold: anything else. Inside an IT block the interpreter takes it, since
@@ -370,11 +401,11 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
         const uint32_t here = c->count;
         a64(c, a64_b(0));
         const uint32_t stub = interpret_stub(t);
-        a64_patch(c->code, here, stub);
+        a64_patch(c, here, stub);
         return;
     }
     a64_mov32(c, X16, t->pc);
-    a64_str_imm(c, X16, CTX, OFF_R(15));
+    a64_str_imm(c, X16, CTX, OFF(instructionPc));
     a64_mov(c, X16, addr);
     if (store) a64_mov(c, X17, dst);
     a64_stp_w(c, 9, 10, CTX, (int)OFF_R(8));
@@ -405,19 +436,20 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
         if (sign && size == 1) a64_sxtb(c, dst, 0);
         else if (sign && size == 2) a64_sxth(c, dst, 0);
         else a64_mov(c, dst, 0);
+        if (sreg >= 0) a64_str_imm(c, dst, CTX, OFF_S((uint32_t)sreg));
     }
     // A fault, or the firmware asking for a reset, stops the core.
     a64_ldrb_imm(c, X16, CTX, OFF(stopRequested));
     const uint32_t toStop = c->count;
     a64(c, a64_cbnz(X16, 0));
     branch_cold_to_hot(t, a64_b(0), back);
-    a64_patch(c->code, toStop, c->count);
+    a64_patch(c, toStop, c->count);
     a64_ldr_imm(c, X16, CTX, OFF(stopReason));
     a64_sub_imm(c, X16, X16, VFC_STOP_FAULT, false);
     const uint32_t toFault = c->count;
     a64(c, a64_cbz(X16, 0));
     exit_stub(t, t->pc + t->size, EXIT_STOP, 1, false);
-    a64_patch(c->code, toFault, c->count);
+    a64_patch(c, toFault, c->count);
     exit_stub(t, t->pc, EXIT_STOP, 1, false);
 }
 
@@ -426,11 +458,11 @@ static void access(tr_t *t, bool store, int size, bool sign, int addr, int dst)
 static void ram_range(tr_t *t, int addr, uint32_t bytes)
 {
     a64_buf_t *h = &t->hot;
-    a64_movz(h, X16, 0x2000, 1);
+    a64_movz(h, X16, VFC_RAM_BASE >> 16, 1);
     a64_sub(h, X16, addr, X16, SH_LSL, 0);
     a64_add_imm(h, X17, X16, bytes - 1, false);
     a64_orr(h, X17, X17, X16, SH_LSL, 0);
-    a64_lsr_imm(h, X17, X17, 19);
+    a64_lsr_imm(h, X17, X17, VFC_RAM_BITS);
     branch_hot_to_cold(t, a64_cbnz(X17, 0), interpret_stub(t));
 }
 
@@ -761,14 +793,14 @@ static int translate16(tr_t *t, uint32_t hw)
         const unsigned tt = hw & 7, n = (hw >> 3) & 7, m = (hw >> 6) & 7;
         a64_add(h, 0, G[n], G[m], SH_LSL, 0);
         switch ((hw >> 9) & 7) {
-        case 0: access(t, true, 4, false, 0, G[tt]); break;
-        case 1: access(t, true, 2, false, 0, G[tt]); break;
-        case 2: access(t, true, 1, false, 0, G[tt]); break;
-        case 3: access(t, false, 1, true, 0, G[tt]); break;
-        case 4: access(t, false, 4, false, 0, G[tt]); break;
-        case 5: access(t, false, 2, false, 0, G[tt]); break;
-        case 6: access(t, false, 1, false, 0, G[tt]); break;
-        case 7: access(t, false, 2, true, 0, G[tt]); break;
+        case 0: access(t, true, 4, false, 0, G[tt], -1); break;
+        case 1: access(t, true, 2, false, 0, G[tt], -1); break;
+        case 2: access(t, true, 1, false, 0, G[tt], -1); break;
+        case 3: access(t, false, 1, true, 0, G[tt], -1); break;
+        case 4: access(t, false, 4, false, 0, G[tt], -1); break;
+        case 5: access(t, false, 2, false, 0, G[tt], -1); break;
+        case 6: access(t, false, 1, false, 0, G[tt], -1); break;
+        case 7: access(t, false, 2, true, 0, G[tt], -1); break;
         }
         return T_OK;
     }
@@ -783,13 +815,13 @@ static int translate16(tr_t *t, uint32_t hw)
         default: size = 2; offset = imm5 << 1; break;
         }
         a64_add_imm(h, 0, G[n], offset, false);
-        access(t, !isLoad, size, false, 0, G[tt]);
+        access(t, !isLoad, size, false, 0, G[tt], -1);
         return T_OK;
     }
     case 0x12: case 0x13: {                             // SP-relative
         const unsigned tt = (hw >> 8) & 7;
         a64_add_imm(h, 0, G[13], (hw & 0xFF) << 2, false);
-        access(t, !(hw & 0x800), 4, false, 0, G[tt]);
+        access(t, !(hw & 0x800), 4, false, 0, G[tt], -1);
         return T_OK;
     }
     case 0x14:                                          // ADR
@@ -948,11 +980,14 @@ static int translate_load_store_single(tr_t *t, uint32_t hw1, uint32_t hw2)
     const unsigned n = hw1 & 0xF, tt = hw2 >> 12;
     const int bytes = size == 0 ? 1 : size == 1 ? 2 : 4;
     if (size == 3) return T_UNSUPPORTED;
-    if (isLoad && tt == 15 && size != 2) return T_OK;   // PLD, PLI: hints
+    // PLD, PLI and the unallocated hints do nothing, but only once their
+    // addressing form has been found valid: otherwise they're UNDEFINED.
+    const bool hint = isLoad && tt == 15 && size != 2;
     if (!isLoad && tt == 15) return T_UNSUPPORTED;
 
     if (n == 15) {                                      // literal
         if (!isLoad) return T_UNSUPPORTED;
+        if (hint) return T_OK;
         const uint32_t imm12 = hw2 & 0xFFF;
         const uint32_t base = (t->pc + 4) & ~3u;
         const uint32_t address = (hw1 & 0x80) ? base + imm12 : base - imm12;
@@ -973,6 +1008,7 @@ static int translate_load_store_single(tr_t *t, uint32_t hw1, uint32_t hw2)
 
     // Address into w0; base writeback before the access, which the
     // interpreter also completes before writing the destination.
+    const uint32_t hotBefore = h->count;
     int writebackSrc = -1;
     if (hw1 & 0x80) {
         const uint32_t imm12 = hw2 & 0xFFF;
@@ -992,9 +1028,14 @@ static int translate_load_store_single(tr_t *t, uint32_t hw1, uint32_t hw2)
             if (wback) writebackSrc = 1;
         }
     } else if ((hw2 & 0xFC0) == 0) {
+        if ((hw2 & 0xF) == 15) return T_UNSUPPORTED;            // UNPREDICTABLE, and G[] has no PC
         a64_add(h, 0, G[n], G[hw2 & 0xF], SH_LSL, (int)((hw2 >> 4) & 3));
     } else {
         return T_UNSUPPORTED;
+    }
+    if (hint) {
+        h->count = hotBefore;                           // the address isn't needed after all
+        return T_OK;
     }
 
     if (isLoad) {
@@ -1007,14 +1048,14 @@ static int translate_load_store_single(tr_t *t, uint32_t hw1, uint32_t hw2)
             return T_END;
         }
         if (writebackSrc >= 0) a64_mov(h, G[n], writebackSrc);
-        access(t, false, bytes, sign, 0, G[tt]);
+        access(t, false, bytes, sign, 0, G[tt], -1);
     } else {
         int value = G[tt];
         if (writebackSrc >= 0) {
             if (tt == n) { a64_mov(h, 2, G[tt]); value = 2; }
             a64_mov(h, G[n], writebackSrc);
         }
-        access(t, true, bytes, false, 0, value);
+        access(t, true, bytes, false, 0, value, -1);
     }
     return T_OK;
 }
@@ -1027,13 +1068,14 @@ static int translate_load_store_dual(tr_t *t, uint32_t hw1, uint32_t hw2)
 
     if (op1 == 1 && op2 == 1 && (op3 == 0 || op3 == 1)) {       // TBB, TBH
         const unsigned m = hw2 & 0xF;
+        if (m == 15) return T_UNSUPPORTED;                      // UNPREDICTABLE, and G[] has no PC
         const int base = rn(t, (int)n, 1);
         if (op3 == 0) {
             a64_add(h, 0, base, G[m], SH_LSL, 0);
-            access(t, false, 1, false, 0, 0);
+            access(t, false, 1, false, 0, 0, -1);
         } else {
             a64_add(h, 0, base, G[m], SH_LSL, 1);
-            access(t, false, 2, false, 0, 0);
+            access(t, false, 2, false, 0, 0, -1);
         }
         a64_mov32(h, 1, t->pc + 4);
         a64_add(h, 0, 1, 0, SH_LSL, 1);
@@ -1064,9 +1106,9 @@ static int translate_load_store_dual(tr_t *t, uint32_t hw1, uint32_t hw2)
     if (isLoad) {
         ram_word(t, false, 2, 0);
         ram_word(t, false, 3, 4);
-        if (wback) a64_mov(h, G[n], 1);
         a64_mov(h, G[tt], 2);
         a64_mov(h, G[t2], 3);
+        if (wback) a64_mov(h, G[n], 1);                // last, as in the interpreter, if n is loaded too
     } else {
         ram_word(t, true, G[tt], 0);
         ram_word(t, true, G[t2], 4);
@@ -1342,16 +1384,20 @@ static int translate_vfp_data(tr_t *t, uint32_t inst)
         s_load(t, 1, n);
         s_load(t, 2, m);
         switch (opc1) {
+        // Arm negates, then adds: FSUB would keep a NaN's sign where FNEG
+        // flips it.
         case 0:                                                 // VMLA, VMLS
             s_load(t, 0, d);
             a64_fmul(h, 3, 1, 2);
-            if (op) a64_fsub(h, 0, 0, 3); else a64_fadd(h, 0, 0, 3);
+            if (op) a64_fneg(h, 3, 3);
+            a64_fadd(h, 0, 0, 3);
             break;
         case 1:                                                 // VNMLS, VNMLA
             s_load(t, 0, d);
             a64_fmul(h, 3, 1, 2);
-            if (op) { a64_fneg(h, 0, 0); a64_fsub(h, 0, 0, 3); }
-            else a64_fsub(h, 0, 3, 0);
+            a64_fneg(h, 0, 0);
+            if (op) a64_fneg(h, 3, 3);
+            a64_fadd(h, 0, 0, 3);
             break;
         case 2:
             if (op) a64_fnmul(h, 0, 1, 2); else a64_fmul(h, 0, 1, 2);
@@ -1500,8 +1546,8 @@ static int translate_vfp(tr_t *t, uint32_t hw1, uint32_t hw2)
         }
         if (add) a64_add_imm(h, 0, G[n], imm8 * 4, false); else a64_sub_imm(h, 0, G[n], imm8 * 4, false);
         if (words == 1) {
-            if (isLoad) { access(t, false, 4, false, 0, 1); sw_store(t, 1, first); }
-            else { sw_load(t, 1, first); access(t, true, 4, false, 0, 1); }
+            if (isLoad) { access(t, false, 4, false, 0, 1, (int)first); sw_store(t, 1, first); }
+            else { sw_load(t, 1, first); access(t, true, 4, false, 0, 1, -1); }
         } else {
             ram_range(t, 0, 8);
             for (unsigned i = 0; i < 2; i++) {
@@ -1590,7 +1636,9 @@ static inline uint16_t fetch(vfc_t *vfc, uint32_t pc)
     return v;
 }
 
-static bool condition_is_always(unsigned cond) { return cond == 0xE; }
+// As ConditionPassed() has it: 1111, which only an IT AL block's else-slots
+// carry (UNPREDICTABLE), is always true as well.
+static bool condition_is_always(unsigned cond) { return cond >= 0xE; }
 
 
 static void *translate(vfc_t *vfc, uint32_t startPc)
@@ -1655,6 +1703,11 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
         } else {
             result = wide ? translate32(t, hw1, hw2) : translate16(t, hw1);
         }
+        if (result == T_END && (itstate & 0xF) && (itstate & 7) != 0) {
+            // A branch before the end of its IT block (UNPREDICTABLE): the
+            // interpreter takes it, keeping the rest of the block's IT state.
+            result = T_UNSUPPORTED;
+        }
 
         if (result == T_UNSUPPORTED) {
             // Undo anything half-emitted, then hand this instruction to the
@@ -1672,7 +1725,7 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
             break;
         }
         if (skip != UINT32_MAX) {
-            a64_patch(t->hot.code, skip, t->hot.count);
+            a64_patch(&t->hot, skip, t->hot.count);
         }
         count++;
         if (isIT) {
@@ -1682,10 +1735,7 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
         }
         pc += wide ? 4 : 2;
         if (result == T_END) {
-            if (itstate & 0xF) {
-                // A branch that isn't the last of its IT block: unpredictable;
-                // the conditional skip already continues below.
-            }
+            // Only ever at the end of an IT block (above), so none is left open.
             ended = true;
             if (skip != UINT32_MAX) {
                 // Not taken: carry on after the branch.
@@ -1694,7 +1744,7 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
             break;
         }
     }
-    if (t->failed || t->hot.overflow || t->cold.overflow || count == 0) {
+    if (t->failed || t->hot.failed || t->cold.failed || count == 0) {
         free(t);
         return NULL;
     }
@@ -1736,7 +1786,12 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
         case 1: to = t->hot.count + f->to; break;
         default: to = (int64_t)f->to - base; break;
         }
-        out[from] = set_offset(out[from], (int32_t)(to - from));
+        const int64_t offset = to - from;
+        if (!a64_reaches(out[from], offset)) {
+            free(t);
+            return NULL;                                        // too far to branch: the interpreter takes it
+        }
+        out[from] = a64_with_offset(out[from], (int32_t)offset);
     }
     if (jit->npending + (uint32_t)t->nlinks > jit->pendingCap) {
         const uint32_t cap = (jit->pendingCap ? jit->pendingCap * 2 : 1024) + (uint32_t)t->nlinks;
@@ -1763,8 +1818,11 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
             continue;
         }
         const uint32_t at = jit->pending[i].at;
-        jit->cache[at] = set_offset(jit->cache[at], (int32_t)base - (int32_t)at);
-        sys_icache_invalidate(jit->cache + at, 4);
+        const int64_t offset = (int64_t)base - (int64_t)at;
+        if (a64_reaches(jit->cache[at], offset)) {
+            jit->cache[at] = a64_with_offset(jit->cache[at], (int32_t)offset);
+            sys_icache_invalidate(jit->cache + at, 4);
+        }
         jit->pending[i] = jit->pending[--jit->npending];
     }
     pthread_jit_write_protect_np(1);
@@ -1778,7 +1836,8 @@ static void *translate(vfc_t *vfc, uint32_t startPc)
 
 // --- Shared code: entry, exit, dispatch
 
-static void emit_shared(struct vfc_jit *jit)
+// False if any of it couldn't be emitted, which would be a bug here.
+static bool emit_shared(struct vfc_jit *jit)
 {
     a64_buf_t b = { jit->cache, 0, 1024, false };
 
@@ -1816,9 +1875,9 @@ static void emit_shared(struct vfc_jit *jit)
 
     // dispatch: w0 = guest pc
     jit->dispatch = b.count;
-    a64_movz(&b, X16, 0x0800, 1);
+    a64_movz(&b, X16, VFC_FLASH_BASE >> 16, 1);
     a64_sub(&b, X16, 0, X16, SH_LSL, 0);
-    a64_lsr_imm(&b, X17, X16, 21);
+    a64_lsr_imm(&b, X17, X16, VFC_FLASH_BITS);
     const uint32_t miss1 = b.count;
     a64(&b, a64_cbnz(X17, 0));
     a64_lsr_imm(&b, X16, X16, 1);
@@ -1827,11 +1886,12 @@ static void emit_shared(struct vfc_jit *jit)
     const uint32_t miss2 = b.count;
     a64(&b, a64_cbz_x(X16, 0));
     a64_br(&b, X16);
-    a64_patch(b.code, miss1, b.count);
-    a64_patch(b.code, miss2, b.count);
+    a64_patch(&b, miss1, b.count);
+    a64_patch(&b, miss2, b.count);
     a64_movz(&b, 1, EXIT_NORMAL, 0);
     a64(&b, a64_b((int32_t)jit->exit - (int32_t)b.count));
     jit->used = b.count;
+    return !b.failed;
 }
 
 static bool jit_init(vfc_t *vfc)
@@ -1839,28 +1899,36 @@ static bool jit_init(vfc_t *vfc)
     if (vfc->jit) return true;
     struct vfc_jit *jit = calloc(1, sizeof(*jit));
     if (!jit) return false;
-    jit->cache = mmap(NULL, CACHE_INSNS * 4, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    jit->cache = mmap(NULL, CACHE_INSNS * 4, CACHE_PROT, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (jit->cache == MAP_FAILED) {
         free(jit);
         return false;
     }
     jit->table = calloc(VFC_FLASH_SIZE / 2, sizeof(void *));
     jit->untranslatable = calloc(VFC_FLASH_SIZE / 2, 1);
-    if (!jit->table || !jit->untranslatable) {
+    bool ok = jit->table && jit->untranslatable;
+    if (ok) {
+        pthread_jit_write_protect_np(0);
+        ok = emit_shared(jit);
+        pthread_jit_write_protect_np(1);
+    }
+    if (!ok) {
         free(jit->table);
         free(jit->untranslatable);
         munmap(jit->cache, CACHE_INSNS * 4);
         free(jit);
         return false;
     }
-    pthread_jit_write_protect_np(0);
-    emit_shared(jit);
-    pthread_jit_write_protect_np(1);
     sys_icache_invalidate(jit->cache, jit->used * 4);
     vfc->jit = jit;
     vfc->jitTable = jit->table;
+#ifdef VFC_JIT_EMULATED
+    vfc->jitLoad = vfc_jit_emulated_helper(0, (void *)jit_load);
+    vfc->jitStore = vfc_jit_emulated_helper(1, (void *)jit_store);
+#else
     vfc->jitLoad = (void *)jit_load;
     vfc->jitStore = (void *)jit_store;
+#endif
     return true;
 }
 
@@ -1954,7 +2022,13 @@ static bool run_once(vfc_t *vfc, uint64_t *budget)
     vfc->jitRam = vfc->ram;
     vfc->jitBudget = (int64_t)(*budget > (uint64_t)INT64_MAX ? INT64_MAX : *budget);
     vfc->jitNzcv = ((uint32_t)cpu->n << 31) | ((uint32_t)cpu->z << 30) | ((uint32_t)cpu->c << 29) | ((uint32_t)cpu->v << 28);
+#ifdef VFC_JIT_EMULATED
+    if (!vfc_jit_emulated_enter(vfc, jit->cache, CACHE_INSNS * 4, jit->cache + jit->enter, entry)) {
+        return false;                   // the emulator caught the generated code misbehaving: a fault says how
+    }
+#else
     ((enter_fn)(void *)(jit->cache + jit->enter))(vfc, entry);
+#endif
     const uint64_t left = (uint64_t)vfc->jitBudget;
     vfc->instructions += *budget - left;
     *budget = left;
