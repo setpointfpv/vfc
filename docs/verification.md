@@ -5,7 +5,8 @@ by machines rather than by review. Firmware runs (`tools/difftest.c` against
 Unicorn, `tools/jitdiff.c` for the JIT) check the paths firmware takes. The
 checks here cover the rest: every encoding, every machine state, every input
 file. `make check` runs them all; CI (`.github/workflows/verify.yml`) runs
-them on Linux, with the JIT emulated, and on Apple silicon, with it native.
+them all on Linux, with the JIT emulated, and all but the proofs on Apple
+silicon, with it native.
 
 | Command | What it establishes | Time |
 | --- | --- | --- |
@@ -15,6 +16,12 @@ them on Linux, with the JIT emulated, and on Apple silicon, with it native.
 | `make encodings` | The AArch64 encoder agrees with an assembler | seconds |
 | `make cbmc` | Proofs (CBMC): no out-of-bounds access or undefined behaviour in the loader, snapshot restore and bus for any input; the immediate encoder correct for all 2^32 values | minutes |
 | `make prove` | Proofs (Z3): the JIT's code for each 16-bit instruction does what the instruction does, from every state | minutes |
+
+They need Unicorn, CBMC, Z3 and Python's Unicorn: on macOS, `brew install
+unicorn cbmc` and `pip3 install z3-solver unicorn`; on Linux, `apt-get install
+libunicorn-dev cbmc clang llvm` and the same pip packages. The Makefile finds
+Homebrew's Unicorn by itself, and a CMake-built one in `/usr/local`;
+`UNICORN="-I<prefix>/include -L<prefix>/lib -lunicorn"` points it elsewhere.
 
 ## The checks
 

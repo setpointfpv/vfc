@@ -56,8 +56,10 @@ jobs:
       - name: Regression tests, under ASan and UBSan
         run: make test
       - name: Floating point against Unicorn's Cortex-M4
-        run: make fpu UNICORN="-I$(brew --prefix)/include -L$(brew --prefix)/lib -lunicorn"
+        run: make fpu
       - name: Encoder against the system assembler
         run: make encodings
       - name: JIT against the interpreter
         run: make fuzz
+      - name: The proofs' translations, built here too
+        run: make .build/check/jitdump && .build/check/jitdump narrow > /dev/null

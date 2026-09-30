@@ -9,6 +9,10 @@
 set -u
 harness=$1
 shift
+if ! command -v cbmc > /dev/null; then
+    echo "$harness: cbmc not found (brew install cbmc, or apt-get install cbmc)"
+    exit 127
+fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 log=$root/.build/check/cbmc-$harness.log
 mkdir -p "$(dirname "$log")"

@@ -37,16 +37,21 @@
 #ifdef VFC_JIT_EMULATED
 // Development builds on other hosts: the generated code runs in an AArch64
 // emulator (tools/jitemu.c), which provides these. The code cache is plain
-// memory there, and the emulator is told whenever code in it changes.
+// memory there, which the host never executes (Apple silicon wouldn't map
+// it writable and executable without MAP_JIT), and the emulator is told
+// whenever code in it changes.
 bool vfc_jit_emulated_enter(vfc_t *vfc, void *code, size_t codeBytes, void *enter, void *block);
 void *vfc_jit_emulated_helper(int which, void *function);
 void vfc_jit_emulated_flush(void *code, size_t length);
+#undef MAP_JIT
 #define MAP_JIT 0
+#define CACHE_PROT (PROT_READ | PROT_WRITE)
 #define pthread_jit_write_protect_np(writable) ((void)(writable))
 #define sys_icache_invalidate(code, length) vfc_jit_emulated_flush(code, length)
 #else
 #include <libkern/OSCacheControl.h>
 #include <pthread.h>
+#define CACHE_PROT (PROT_READ | PROT_WRITE | PROT_EXEC)
 #endif
 
 #include "jit_emit.h"
@@ -1894,7 +1899,7 @@ static bool jit_init(vfc_t *vfc)
     if (vfc->jit) return true;
     struct vfc_jit *jit = calloc(1, sizeof(*jit));
     if (!jit) return false;
-    jit->cache = mmap(NULL, CACHE_INSNS * 4, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    jit->cache = mmap(NULL, CACHE_INSNS * 4, CACHE_PROT, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (jit->cache == MAP_FAILED) {
         free(jit);
         return false;
