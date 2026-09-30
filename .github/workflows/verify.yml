@@ -11,8 +11,8 @@ jobs:
     name: Linux, JIT emulated
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Tools
@@ -39,7 +39,7 @@ jobs:
       matrix:
         harness: [load, restore, bus, logical_imm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Tools
         run: |
           sudo apt-get update
@@ -50,7 +50,7 @@ jobs:
     name: Apple silicon, JIT native
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: brew install unicorn
       - run: swift build
       - name: Regression tests, under ASan and UBSan
