@@ -72,6 +72,9 @@ struct vfc {
     uint64_t instructions;
     bool stopRequested;
     vfc_stop_t stopReason;
+    // The instruction being executed, which fault reports name. (The
+    // interpreter has already moved r[15] on to the next one.)
+    uint32_t instructionPc;
     char fault[160];
 
     // Mailbox state.

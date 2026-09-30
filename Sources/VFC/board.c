@@ -176,7 +176,7 @@ static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
         return;
     case MBX_FAULT:
         vfc_raise_fault(vfc, "firmware reported fault 0x%x at pc 0x%08x (lr 0x%08x)",
-                        value, vfc->cpu.r[15], vfc->cpu.r[14]);
+                        value, vfc->instructionPc, vfc->cpu.r[14]);
         return;
     case MBX_MOTOR_COUNT: vfc->motorCount = value; return;
     case MBX_MOTOR_SEQ: vfc->motorSeq = value; return;
@@ -238,7 +238,7 @@ uint32_t vfc_bus_read(vfc_t *vfc, uint32_t address, int size)
         memcpy(&value, vfc->scs + (address - VFC_SCS_BASE), (size_t)size);
         return value;
     }
-    vfc_raise_fault(vfc, "bus fault reading %d bytes at 0x%08x (pc 0x%08x)", size, address, vfc->cpu.r[15]);
+    vfc_raise_fault(vfc, "bus fault reading %d bytes at 0x%08x (pc 0x%08x)", size, address, vfc->instructionPc);
     return 0;
 }
 
@@ -256,7 +256,7 @@ void vfc_bus_write(vfc_t *vfc, uint32_t address, uint32_t value, int size)
         memcpy(vfc->scs + (address - VFC_SCS_BASE), &value, (size_t)size);
         return;
     }
-    vfc_raise_fault(vfc, "bus fault writing %d bytes at 0x%08x (pc 0x%08x)", size, address, vfc->cpu.r[15]);
+    vfc_raise_fault(vfc, "bus fault writing %d bytes at 0x%08x (pc 0x%08x)", size, address, vfc->instructionPc);
 }
 
 // --- Lifecycle
@@ -267,10 +267,8 @@ vfc_t *vfc_create(void)
     if (!vfc) {
         return NULL;
     }
-    // A few spare bytes past each: the JIT's range check lets an access start
-    // at any offset inside the region.
-    vfc->flash = calloc(1, VFC_FLASH_SIZE + 16);
-    vfc->ram = calloc(1, VFC_RAM_SIZE + 16);
+    vfc->flash = calloc(1, VFC_FLASH_SIZE);
+    vfc->ram = calloc(1, VFC_RAM_SIZE);
     vfc->scs = calloc(1, VFC_SCS_SIZE);
     if (!vfc->flash || !vfc->ram || !vfc->scs) {
         vfc_destroy(vfc);
@@ -298,11 +296,18 @@ void vfc_destroy(vfc_t *vfc)
     free(vfc);
 }
 
+// Whether [address, address + size) is a non-empty part of RAM. The size is
+// compared with what's left of RAM, never added to the address, so nothing
+// can wrap.
+static bool ram_region_valid(uint32_t address, uint32_t size)
+{
+    const uint32_t offset = address - VFC_RAM_BASE;
+    return size > 0 && offset < VFC_RAM_SIZE && size <= VFC_RAM_SIZE - offset;
+}
+
 static bool config_region_valid(const vfc_t *vfc)
 {
-    return vfc->eepromSize > 0
-        && vfc->eepromAddress - VFC_RAM_BASE < VFC_RAM_SIZE
-        && vfc->eepromAddress - VFC_RAM_BASE + vfc->eepromSize <= VFC_RAM_SIZE;
+    return ram_region_valid(vfc->eepromAddress, vfc->eepromSize);
 }
 
 void vfc_reset(vfc_t *vfc)
@@ -342,21 +347,26 @@ vfc_error_t vfc_load(vfc_t *vfc, const uint8_t *image, size_t length, uint32_t b
     if (base != VFC_FLASH_BASE || length < 64 || length > VFC_FLASH_SIZE) {
         return VFC_ERR_IMAGE;
     }
+    // Everything is checked before the board changes. Offsets into the image
+    // are compared with what's left of it, never added to, so nothing wraps.
     uint32_t vectors[8];
     memcpy(vectors, image, sizeof(vectors));
-    const uint32_t info = vectors[7];
+    const uint32_t info = vectors[7] - VFC_FLASH_BASE;
+    uint32_t fields[6];
     if (vectors[0] - VFC_RAM_BASE > VFC_RAM_SIZE
         || vectors[1] - VFC_FLASH_BASE >= length
-        || info - VFC_FLASH_BASE + 24 > length) {
+        || info > length - sizeof(fields)) {
         return VFC_ERR_IMAGE;
     }
-    uint32_t fields[6];
-    memcpy(fields, image + (info - VFC_FLASH_BASE), sizeof(fields));
+    memcpy(fields, image + info, sizeof(fields));
     if (fields[0] != BOARD_INFO_MAGIC) {
         return VFC_ERR_IMAGE;
     }
     if (fields[1] != VFC_ABI) {
         return VFC_ERR_ABI;
+    }
+    if (!ram_region_valid(fields[3], fields[4])) {
+        return VFC_ERR_IMAGE;
     }
 
     vfc_jit_flush(vfc);
@@ -365,14 +375,18 @@ vfc_error_t vfc_load(vfc_t *vfc, const uint8_t *image, size_t length, uint32_t b
     vfc->flashUsed = (uint32_t)length;
     vfc->eepromAddress = fields[3];
     vfc->eepromSize = fields[4];
-    if (!config_region_valid(vfc)) {
-        return VFC_ERR_IMAGE;
+    // The version string, cut short at the end of the image.
+    const uint32_t version = fields[5] - VFC_FLASH_BASE;
+    size_t versionLength = 0;
+    if (version < length) {
+        const size_t limit = length - version < sizeof(vfc->firmwareVersion) - 1
+                           ? length - version : sizeof(vfc->firmwareVersion) - 1;
+        while (versionLength < limit && image[version + versionLength]) {
+            versionLength++;
+        }
+        memcpy(vfc->firmwareVersion, image + version, versionLength);
     }
-    vfc->firmwareVersion[0] = 0;
-    if (fields[5] - VFC_FLASH_BASE < length) {
-        const char *version = (const char *)vfc->flash + (fields[5] - VFC_FLASH_BASE);
-        strncpy(vfc->firmwareVersion, version, sizeof(vfc->firmwareVersion) - 1);
-    }
+    vfc->firmwareVersion[versionLength] = 0;
     vfc_reset(vfc);
     return VFC_OK;
 }
@@ -643,6 +657,46 @@ void vfc_snapshot(const vfc_t *vfc, uint8_t *out)
     memcpy(out, vfc->scs, VFC_SCS_SIZE);
 }
 
+_Static_assert(sizeof(bool) == 1, "snapshot bools are single bytes");
+
+// A field of the vfc_t inside a snapshot.
+#define STATE_FIELD(state, field, out) memcpy(&(out), (state) + offsetof(vfc_t, field), sizeof(out))
+
+// A snapshot is a file, so anything restore would otherwise trust as an
+// index, a length, a string or a bool is checked first.
+static bool snapshot_state_valid(const uint8_t *state)
+{
+    uint32_t fifo[4], consoleLength;
+    STATE_FIELD(state, toGuest.head, fifo[0]);
+    STATE_FIELD(state, toGuest.tail, fifo[1]);
+    STATE_FIELD(state, fromGuest.head, fifo[2]);
+    STATE_FIELD(state, fromGuest.tail, fifo[3]);
+    for (int i = 0; i < 4; i++) {
+        if (fifo[i] >= VFC_SERIAL_CAPACITY) {
+            return false;
+        }
+    }
+    STATE_FIELD(state, consoleLength, consoleLength);
+    if (consoleLength > VFC_CONSOLE_CAPACITY) {
+        return false;
+    }
+    vfc_stop_t stopReason;
+    STATE_FIELD(state, stopReason, stopReason);
+    if ((uint32_t)stopReason > VFC_STOP_RESET) {
+        return false;
+    }
+    static const size_t bools[] = {
+        offsetof(vfc_t, cpu.n), offsetof(vfc_t, cpu.z), offsetof(vfc_t, cpu.c), offsetof(vfc_t, cpu.v),
+        offsetof(vfc_t, cpu.q), offsetof(vfc_t, stopRequested), offsetof(vfc_t, blackboxOpen),
+    };
+    for (size_t i = 0; i < sizeof(bools) / sizeof(bools[0]); i++) {
+        if (state[bools[i]] > 1) {
+            return false;
+        }
+    }
+    return memchr(state + offsetof(vfc_t, fault), 0, sizeof(((vfc_t *)0)->fault)) != NULL;
+}
+
 vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length)
 {
     snapshot_header_t header;
@@ -655,10 +709,19 @@ vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length)
         return VFC_ERR_IMAGE;
     }
     snapshot += sizeof(header);
+    if (!snapshot_state_valid(snapshot)) {
+        return VFC_ERR_IMAGE;
+    }
 
+    // This instance's own, not the snapshot's: its buffers, its JIT, and what
+    // it read from the image when it was loaded.
     uint8_t *flash = vfc->flash, *ram = vfc->ram, *scs = vfc->scs, *blackbox = vfc->blackbox;
     const size_t blackboxCapacity = vfc->blackboxCapacity;
-    uint8_t jit[JIT_STATE_LENGTH];                  // this instance's own, not the snapshot's
+    const uint32_t flashUsed = vfc->flashUsed, clockHz = vfc->clockHz;
+    const uint32_t eepromAddress = vfc->eepromAddress, eepromSize = vfc->eepromSize;
+    char firmwareVersion[sizeof(vfc->firmwareVersion)];
+    memcpy(firmwareVersion, vfc->firmwareVersion, sizeof(firmwareVersion));
+    uint8_t jit[JIT_STATE_LENGTH];
     memcpy(jit, (uint8_t *)vfc + JIT_STATE_START, JIT_STATE_LENGTH);
     memcpy(vfc, snapshot, sizeof(vfc_t));
     memcpy((uint8_t *)vfc + JIT_STATE_START, jit, JIT_STATE_LENGTH);
@@ -668,6 +731,11 @@ vfc_error_t vfc_restore(vfc_t *vfc, const uint8_t *snapshot, size_t length)
     vfc->blackbox = blackbox;
     vfc->blackboxCapacity = blackboxCapacity;
     vfc->blackboxLength = 0;
+    vfc->flashUsed = flashUsed;
+    vfc->clockHz = clockHz;
+    vfc->eepromAddress = eepromAddress;
+    vfc->eepromSize = eepromSize;
+    memcpy(vfc->firmwareVersion, firmwareVersion, sizeof(firmwareVersion));
     snapshot += sizeof(vfc_t);
     memcpy(vfc->ram, snapshot, VFC_RAM_SIZE);
     snapshot += VFC_RAM_SIZE;

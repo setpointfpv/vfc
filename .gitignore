@@ -6,3 +6,4 @@ tools/difftest
 tools/jitdiff
 tools/encodings
 *.dSYM/
+tools/jitfuzz

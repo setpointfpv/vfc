@@ -1184,21 +1184,24 @@ static void multiply(ctx_t *x, uint32_t hw1, uint32_t hw2)
         }
         return;
     }
+    // The most significant word multiplies work modulo 2^64: bits 63:32 come
+    // out as the pseudocode's unbounded arithmetic has them, and nothing
+    // overflows a signed type.
     case 5: {                               // SMMLA, SMMUL
-        int64_t result = (int64_t)(int32_t)rn * (int32_t)rm;
+        uint64_t result = (uint64_t)((int64_t)(int32_t)rn * (int32_t)rm);
         if (a != 15) {
-            result += (int64_t)((uint64_t)cpu->r[a] << 32);
+            result += (uint64_t)cpu->r[a] << 32;
         }
         if (hw2 & 0x10) {
-            result += 0x80000000LL;
+            result += 0x80000000u;
         }
         cpu->r[d] = (uint32_t)(result >> 32);
         return;
     }
     case 6: {                               // SMMLS
-        int64_t result = (int64_t)((uint64_t)cpu->r[a] << 32) - (int64_t)(int32_t)rn * (int32_t)rm;
+        uint64_t result = ((uint64_t)cpu->r[a] << 32) - (uint64_t)((int64_t)(int32_t)rn * (int32_t)rm);
         if (hw2 & 0x10) {
-            result += 0x80000000LL;
+            result += 0x80000000u;
         }
         cpu->r[d] = (uint32_t)(result >> 32);
         return;
@@ -1564,6 +1567,10 @@ static void vfp(ctx_t *x, uint32_t hw1, uint32_t hw2)
         const uint32_t base = n == 15 ? align4(x->pc + 4) : cpu->r[n];
         const uint32_t address = add ? base + imm8 * 4 : base - imm8 * 4;
         const unsigned words = doubleRegs ? 2 : 1;
+        if (first + words > 32) {           // D16-D31, which FPv4-SP doesn't have
+            undefined(x, inst, true);
+            return;
+        }
         for (unsigned i = 0; i < words; i++) {
             if (isLoad) {
                 cpu->s.u[first + i] = load(vfc, address + 4 * i, 4);
@@ -1731,6 +1738,7 @@ void vfc_cpu_run(vfc_t *vfc, uint64_t budget)
 
     while (budget-- > 0 && !vfc->stopRequested) {
         const uint32_t pc = cpu->r[15];
+        vfc->instructionPc = pc;            // before the fetch, which can fault too
         const uint32_t hw1 = fetch16(vfc, pc);
         const bool wide = (hw1 >> 11) >= 0x1D;
         const uint32_t hw2 = wide ? fetch16(vfc, pc + 2) : 0;
