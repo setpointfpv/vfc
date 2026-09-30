@@ -134,19 +134,6 @@ static void uc_state(uc_engine *uc, state_t *out)
     out->primask = primask;
 }
 
-static bool same_float_bits(uint32_t a, uint32_t b)
-{
-    if (a == b) {
-        return true;
-    }
-    // Both NaN: the payload may legitimately differ between implementations
-    // only in default-NaN handling; report it separately if it matters.
-    float fa, fb;
-    memcpy(&fa, &a, 4);
-    memcpy(&fb, &b, 4);
-    return isnan(fa) && isnan(fb);
-}
-
 static int compare(const state_t *a, const state_t *b, char *out, size_t size)
 {
     int differences = 0;
@@ -166,7 +153,7 @@ static int compare(const state_t *a, const state_t *b, char *out, size_t size)
         differences++;
     }
     for (int i = 0; i < 32; i++) {
-        if (!same_float_bits(a->s[i], b->s[i])) {
+        if (a->s[i] != b->s[i]) {                   // NaNs too: both follow Arm's rules
             float fa, fb;
             memcpy(&fa, &a->s[i], 4);
             memcpy(&fb, &b->s[i], 4);

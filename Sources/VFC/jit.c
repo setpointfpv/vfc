@@ -1380,16 +1380,20 @@ static int translate_vfp_data(tr_t *t, uint32_t inst)
         s_load(t, 1, n);
         s_load(t, 2, m);
         switch (opc1) {
+        // Arm negates, then adds: FSUB would keep a NaN's sign where FNEG
+        // flips it.
         case 0:                                                 // VMLA, VMLS
             s_load(t, 0, d);
             a64_fmul(h, 3, 1, 2);
-            if (op) a64_fsub(h, 0, 0, 3); else a64_fadd(h, 0, 0, 3);
+            if (op) a64_fneg(h, 3, 3);
+            a64_fadd(h, 0, 0, 3);
             break;
         case 1:                                                 // VNMLS, VNMLA
             s_load(t, 0, d);
             a64_fmul(h, 3, 1, 2);
-            if (op) { a64_fneg(h, 0, 0); a64_fsub(h, 0, 0, 3); }
-            else a64_fsub(h, 0, 3, 0);
+            a64_fneg(h, 0, 0);
+            if (op) a64_fneg(h, 3, 3);
+            a64_fadd(h, 0, 0, 3);
             break;
         case 2:
             if (op) a64_fnmul(h, 0, 1, 2); else a64_fmul(h, 0, 1, 2);
