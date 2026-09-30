@@ -106,6 +106,14 @@ static void vfc_state(const vfc_t *vfc, state_t *out)
     out->primask = cpu->primask;
 }
 
+// Unicorn's IT state: ITSTATE[1:0] is XPSR[26:25], ITSTATE[7:2] XPSR[15:10].
+static uint32_t uc_itstate(uc_engine *uc)
+{
+    uint32_t xpsr = 0;
+    uc_reg_read(uc, UC_ARM_REG_XPSR, &xpsr);
+    return ((xpsr >> 25) & 3) | ((xpsr >> 8) & 0xFC);
+}
+
 static void uc_state(uc_engine *uc, state_t *out)
 {
     static int ids[16 + 32];
@@ -296,7 +304,7 @@ int main(int argc, char **argv)
         const uint16_t hw1 = (uint16_t)(image[instPc - VFC_FLASH_BASE] | (image[instPc - VFC_FLASH_BASE + 1] << 8));
         const bool isWfi = hw1 == 0xBF30;
         vfc_stop_t stop = vfc_run(vfc, 1);
-        // Unicorn runs a whole IT block as one step.
+        // An IT block is one step, in both.
         while ((vfc->cpu.itstate & 0xF) && stop == VFC_STOP_BUDGET) {
             stop = vfc_run(vfc, 1);
         }
@@ -306,6 +314,13 @@ int main(int argc, char **argv)
         }
 
         uc_err err = uc_emu_start(uc, pc, 0xFFFFFFFFu, 0, 1);
+        // Unicorn usually runs a whole IT block as one step, as vfc just did,
+        // but it can stop inside one (before a store, say): finish it.
+        for (int i = 0; i < 4 && err == UC_ERR_OK && uc_itstate(uc); i++) {
+            uint32_t at;
+            uc_reg_read(uc, UC_ARM_REG_PC, &at);
+            err = uc_emu_start(uc, at | 1, 0xFFFFFFFFu, 0, 1);
+        }
         if (err != UC_ERR_OK) {
             printf("unicorn: %s at step %llu, pc %08x\n", uc_strerror(err), (unsigned long long)steps, pc & ~1u);
             break;
