@@ -1,9 +1,11 @@
 # Tests, fuzzing and proofs for the core. What each establishes, and what it
 # relies on, is in docs/verification.md; `make check` runs them all locally.
+# Runs on pull requests, which main requires, and on main once they merge.
 name: Verify
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
