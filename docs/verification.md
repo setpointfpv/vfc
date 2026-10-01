@@ -97,7 +97,12 @@ follows the interpreter, since the claim is that the JIT agrees with it.
 the JIT emits (26,258 for the 16-bit instructions), from random states.
 
 Of the 54,736 16-bit encodings the JIT translates, the 30,160 that don't
-touch memory are proved. Loads and stores are next.
+touch memory are proved. Loads and stores are left to `make fuzz`. Proofs of
+them were written and dropped
+([#2](https://github.com/setpointfpv/vfc/pull/2)): they found no bugs, and
+they tripled what CI cost whenever everything had to be proved again. Of
+eleven bugs planted in the JIT's memory code to test them, the fuzzer caught
+nine. Catching the other two needs the first two items under Next.
 
 ## What this found
 
@@ -147,14 +152,20 @@ snapshot, or an instruction or state that Betaflight never produces.
 
 ## Next
 
-1. **Loads and stores in the proofs**: the other 24,576 16-bit encodings,
-   with the bus as an uninterpreted function whose calls must match the
-   interpreter's, and the RAM, flash and time-register fast paths proved
-   against it.
-2. **Instructions inside IT blocks**: conditional, and without setting
-   flags; proved as `IT; instruction` blocks.
-3. **32-bit Thumb-2 and FPv4-SP**: symbolic fields per encoding class, and
-   floating point modelled bit for bit, NaNs included, as `cpu.c` computes it.
+1. **Fuzzing blocks of several instructions**: each test is one instruction
+   or one IT block, so nothing checks what the JIT carries from one
+   instruction to the next, such as guest r8-lr, which live in caller-saved
+   host registers and must be saved around every call into C.
+2. **Distinct time registers in the fuzzer**: time never moves on its boards,
+   so the four time registers nearly always all read zero, and a fast path
+   that reads the wrong one passes. Each state should give them different
+   values.
+3. **Fuzzing 32-bit Thumb-2 and FPv4-SP in depth**: the 32,768 random
+   encodings are spread over 13 classes, about 2,300 per class, and half the
+   floating point data-processing ones are double precision, which FPv4-SP
+   doesn't have. Choose tests per instruction rather than per class, and run
+   the fuzzer under coverage (gcov over `jit.c`) to find the translator paths
+   it never reaches.
 4. **The interpreter against Arm's specification**: Arm publishes its
    pseudocode in machine-readable form (ASL) for A-profile, whose AArch32
    part includes the Thumb and VFP instructions vfc implements; through ASLp

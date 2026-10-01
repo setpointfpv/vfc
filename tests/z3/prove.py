@@ -196,7 +196,7 @@ def main():
             counts[key] += 1
             if key == 'FAILED' or only is not None:
                 print('%04x: %s' % (hw, result))
-    print('%d 16-bit encodings the JIT translates: %d proved, %d not yet covered (loads and stores), %d failed, in %.0fs'
+    print('%d 16-bit encodings the JIT translates: %d proved, %d not covered (loads and stores, left to make fuzz), %d failed, in %.0fs'
           % (len(lines), counts['proved'], counts['not covered'], counts['FAILED'], time.time() - start))
     return 1 if counts['FAILED'] else 0
 
