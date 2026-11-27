@@ -97,6 +97,14 @@ void vfc_set_battery(vfc_t *vfc, uint32_t millivolts, uint32_t milliamps);
 /// A motor's speed as bidirectional DShot reports it, in eRPM / 100 (the
 /// unit a blackbox log records).
 void vfc_set_erpm100(vfc_t *vfc, int motor, uint32_t erpm100);
+/// The gyro's sample rate in Hz, for firmware that takes it from the host.
+/// Firmware reads it once, at gyro init, so set it before the first run and
+/// post samples at that rate. 0, the default, leaves the firmware at its own
+/// rate.
+void vfc_set_gyro_rate(vfc_t *vfc, uint32_t hz);
+/// The rate the firmware says its gyro runs at, written at gyro init. 0 when
+/// it hasn't said, as firmware from before GYRO_RATE_HZ never does.
+uint32_t vfc_gyro_rate_used(const vfc_t *vfc);
 
 // Outputs.
 int vfc_motor_count(const vfc_t *vfc);

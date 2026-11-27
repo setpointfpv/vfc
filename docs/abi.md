@@ -61,9 +61,11 @@ reads it. WO: the firmware only writes it (the host may read it back).
 | `0x024` | PUTC | WO | Debug console, one character |
 | `0x028` | RESET | WO | Any write: the firmware wants a reset |
 | `0x02C` | FAULT | WO | Any write: the firmware hit a fault (the value says which) |
+| `0x030` | GYRO_RATE_USED | WO | The gyro sample rate the firmware runs at, in Hz, written at gyro init |
 | `0x040`–`0x048` | GYRO_X..Z | RO | Gyro sample, int16 counts, 16.384 per deg/s |
 | `0x04C`–`0x054` | ACC_X..Z | RO | Accelerometer sample, int16 counts |
 | `0x058` | SENSOR_SEQ | RO | Changes each time the host posts a sample |
+| `0x05C` | GYRO_RATE_HZ | RO | The rate the host posts gyro samples at, in Hz; 0 leaves it to the firmware |
 | `0x060` | RC_COUNT | RO | Channels in the current RC frame |
 | `0x064` | RC_SEQ | RO | Changes each time the host posts a frame |
 | `0x068` | VBAT_MV | RO | Pack voltage, millivolts |
@@ -80,6 +82,15 @@ reads it. WO: the firmware only writes it (the host may read it back).
 | `0x154` | BLACKBOX_CONTROL | WO | 1 begins a log, 2 ends it |
 
 Unlisted offsets read as zero and ignore writes.
+
+GYRO_RATE_HZ and GYRO_RATE_USED came after version 1 was first published, and
+need no new version because both sides read the other's absence as zero. A
+host without them reads 0 for GYRO_RATE_HZ, which tells the firmware to keep
+its own rate; firmware without them never writes GYRO_RATE_USED, so the host
+reads 0 and knows the rate wasn't taken. Firmware that takes the rate reads
+GYRO_RATE_HZ once, at gyro init, and writes back the rate it settled on, so a
+host replaying a flight sets the rate before the first run, posts samples at
+it, and checks GYRO_RATE_USED once the firmware has booted.
 
 ## Stepping
 

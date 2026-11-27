@@ -104,6 +104,10 @@ struct vfc {
     int16_t gyro[3];
     int16_t acc[3];
     uint32_t sensorSeq;
+    // GYRO_RATE_HZ as the host set it, and GYRO_RATE_USED as the firmware
+    // wrote it back.
+    uint32_t gyroRateHz;
+    uint32_t gyroRateUsed;
     uint16_t rc[16];
     uint32_t rcCount;
     uint32_t rcSeq;
