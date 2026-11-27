@@ -182,6 +182,33 @@ static void test_restore(void)
     vfc_destroy(v);
 }
 
+// --- The gyro rate: firmware reads GYRO_RATE_HZ and writes back the rate it took
+
+static void test_gyro_rate(void)
+{
+    // movw r0, #0; movt r0, #0x4000; ldr r1, [r0, #0x5C]; str r1, [r0, #0x30]; wfi
+    static const uint16_t echo[] = { 0xF240, 0x0000, 0xF2C4, 0x0000, 0x6DC1, 0x6301, 0xBF30 };
+    for (int e = 0; e < engines(); e++) {
+        vfc_t *v = board(echo, 7, e);
+        check(vfc_gyro_rate_used(v) == 0, "gyro rate (%s): nothing written before the firmware runs", engine_name(e));
+        vfc_set_gyro_rate(v, 3205);
+        vfc_run(v, 64);
+        check(vfc_gyro_rate_used(v) == 3205, "gyro rate (%s): the firmware read the host's rate and wrote it back",
+              engine_name(e));
+        // A reset forgets what the firmware wrote and keeps what the host set.
+        vfc_reset(v);
+        check(vfc_gyro_rate_used(v) == 0, "gyro rate (%s): reset clears GYRO_RATE_USED", engine_name(e));
+        vfc_run(v, 64);
+        check(vfc_gyro_rate_used(v) == 3205, "gyro rate (%s): the host's rate survives a reset", engine_name(e));
+        vfc_destroy(v);
+    }
+    // A host that never sets it reads as zero, which firmware takes as its own rate.
+    vfc_t *v = board(echo, 7, false);
+    vfc_run(v, 64);
+    check(vfc_gyro_rate_used(v) == 0, "gyro rate: zero when the host sets none");
+    vfc_destroy(v);
+}
+
 // --- Instructions
 
 typedef struct {
@@ -358,6 +385,7 @@ int main(int argc, char **argv)
         { "vldr_d16", test_vldr_d16 },
         { "ram_edge", test_ram_edge_and_fault_pc },
         { "nans", test_nans },
+        { "gyro_rate", test_gyro_rate },
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         bool chosen = argc < 2;                     // all, or those named

@@ -123,6 +123,17 @@ public final class VirtualFlightController {
         vfc_set_erpm100(handle, Int32(motor), erpm100)
     }
 
+    /// The gyro's sample rate in Hz, for firmware that takes it from the host.
+    /// Firmware reads it at gyro init, so set it before the first run. Zero,
+    /// the default, leaves the firmware at its own rate.
+    public var gyroRate: UInt32 = 0 {
+        didSet { vfc_set_gyro_rate(handle, gyroRate) }
+    }
+
+    /// The rate the firmware says its gyro runs at, once it has booted. Zero
+    /// from firmware that predates GYRO_RATE_HZ.
+    public var gyroRateUsed: UInt32 { vfc_gyro_rate_used(handle) }
+
     // MARK: Outputs
 
     public var motors: [Float] {

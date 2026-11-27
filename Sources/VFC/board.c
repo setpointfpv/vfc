@@ -24,9 +24,11 @@ enum {
     MBX_PUTC = 0x024,
     MBX_RESET = 0x028,
     MBX_FAULT = 0x02C,
+    MBX_GYRO_RATE_USED = 0x030,
     MBX_GYRO_X = 0x040,
     MBX_ACC_X = 0x04C,
     MBX_SENSOR_SEQ = 0x058,
+    MBX_GYRO_RATE_HZ = 0x05C,
     MBX_RC_COUNT = 0x060,
     MBX_RC_SEQ = 0x064,
     MBX_VBAT_MV = 0x068,
@@ -115,6 +117,8 @@ static uint32_t mailbox_register(vfc_t *vfc, uint32_t offset)
     case MBX_IDLE_UNTIL: return vfc->timeRegs[TIME_IDLE_UNTIL];
     case MBX_CLOCK_HZ: return vfc->clockHz;
     case MBX_SENSOR_SEQ: return vfc->sensorSeq;
+    case MBX_GYRO_RATE_HZ: return vfc->gyroRateHz;
+    case MBX_GYRO_RATE_USED: return vfc->gyroRateUsed;
     case MBX_RC_COUNT: return vfc->rcCount;
     case MBX_RC_SEQ: return vfc->rcSeq;
     case MBX_VBAT_MV: return vfc->vbatMv;
@@ -164,6 +168,7 @@ static void mailbox_write(vfc_t *vfc, uint32_t offset, uint32_t value)
     switch (offset) {
     case MBX_GUEST_ABI: vfc->guestAbi = value; return;
     case MBX_STAGE: vfc->stage = value; return;
+    case MBX_GYRO_RATE_USED: vfc->gyroRateUsed = value; return;
     case MBX_IDLE_UNTIL: vfc->timeRegs[TIME_IDLE_UNTIL] = value; return;
     case MBX_PUTC:
         if (vfc->consoleLength < VFC_CONSOLE_CAPACITY) {
@@ -334,6 +339,7 @@ void vfc_reset(vfc_t *vfc)
     vfc->timeRegs[TIME_IDLE_UNTIL] = vfc->timeRegs[TIME_CYCLES];
     vfc->guestAbi = 0;
     vfc->stage = 0;
+    vfc->gyroRateUsed = 0;
     vfc->motorCount = 0;
     vfc->motorSeq = 0;
     memset(vfc->motor, 0, sizeof(vfc->motor));
@@ -508,6 +514,16 @@ void vfc_set_erpm100(vfc_t *vfc, int motor, uint32_t erpm100)
     if (motor >= 0 && motor < 8) {
         vfc->erpm[motor] = erpm100;
     }
+}
+
+void vfc_set_gyro_rate(vfc_t *vfc, uint32_t hz)
+{
+    vfc->gyroRateHz = hz;
+}
+
+uint32_t vfc_gyro_rate_used(const vfc_t *vfc)
+{
+    return vfc->gyroRateUsed;
 }
 
 int vfc_motor_count(const vfc_t *vfc)
